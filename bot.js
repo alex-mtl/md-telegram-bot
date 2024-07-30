@@ -338,18 +338,18 @@ bot.on('callback_query', async (callbackQuery) => {
 
     responseText += `Go:\n`;
     responseText += (await Promise.all(
-        event.participants.go.map(async (id) => {
+        event.participants.go.map(async (id, index) => {
             const username = await getUsernameFromId(id);
-            return `<a href="tg:\/\/user?id=${id}">${username}<\/a>`;
+            return `${index + 1}. <a href="tg:\/\/user?id=${id}">${username}<\/a>`;
         })
     )).filter(username => username !== null).join('\n');
     responseText += `\n\n`;
     // responseText += `Go:\n${event.participants.go.map(id => `@${username}`).join('\n')}\n\n`;
     responseText += `Can't go:\n`;
     responseText += (await Promise.all(
-        event.participants.cantGo.map(async (id) => {
+        event.participants.cantGo.map(async (id, index) => {
             const username = await getUsernameFromId(id);
-            return `<a href="tg:\/\/user?id=${id}">${username}<\/a>`;
+            return `${index + 1}. <a href="tg:\/\/user?id=${id}">${username}<\/a>`;
             // return `@${id}`;
         })
     )).filter(username => username !== null).join('\n');
@@ -358,10 +358,10 @@ bot.on('callback_query', async (callbackQuery) => {
     responseText += `Attend but late:\n`
         //${event.participants.late.map(id => `@${username}`).join('\n')}`;
     responseText += (await Promise.all(
-        event.participants.late.map(async (id) => {
+        event.participants.late.map(async (id, index) => {
             const username = await getUsernameFromId(id);
             // return username ? `${username}` : null;
-            return `<a href="tg:\/\/user?id=${id}">${username}<\/a>`;
+            return `${index + 1}. <a href="tg:\/\/user?id=${id}">${username}<\/a>`;
 
         })
     )).filter(username => username !== null).join('\n');
