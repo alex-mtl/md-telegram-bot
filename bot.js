@@ -246,6 +246,15 @@ function loadEvent(chatId, eventId) {
     return null;
 }
 
+function loadEvents(chatId) {
+    const eventsDir = path.join(__dirname, 'events');
+    const eventFiles = fs.readdirSync(eventsDir).filter(file => file.startsWith(`${chatId}_`));
+
+    return eventFiles.map(file => {
+        const eventId = file.split('_')[1].split('.')[0];
+        return loadEvent(chatId, eventId);
+    }).filter(event => event !== null);
+}
 bot.onText(/\/create_event (.+)/, (msg, match) => {
     const chatId = msg.chat.id;
     const threadId = msg.message_thread_id;
@@ -264,6 +273,8 @@ bot.onText(/\/create_event (.+)/, (msg, match) => {
         title,
         description,
         time,
+        originalMessageId: msg.message_id,
+        comments: {},
         participants: {
             go: [],
             cantGo: [],
@@ -273,7 +284,7 @@ bot.onText(/\/create_event (.+)/, (msg, match) => {
 
     saveEvent(chatId, eventId, event);
 
-    bot.sendMessage(chatId, `Event created: ${title}\n${description}\nTime: ${time}`, {
+    bot.sendMessage(chatId, `Event: \n${title}\n${description}\nTime: ${time}`, {
         ...thread,
         reply_markup: {
             inline_keyboard: [
@@ -284,6 +295,8 @@ bot.onText(/\/create_event (.+)/, (msg, match) => {
         }
     }).then((sentMessage) => {
         bot.pinChatMessage(chatId, sentMessage.message_id);
+        event.postMessageId = sentMessage.message_id; // Store the event post message ID
+        saveEvent(chatId, eventId, event);
     });
 
     // schedule.scheduleJob(new Date(Date.parse(time) - 10 * 60 * 1000), () => {
@@ -298,9 +311,11 @@ bot.onText(/\/create_event (.+)/, (msg, match) => {
 
 bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
-    const [action, chatId, eventId] = data.split('_');
+    const [action, chatId, eventId, threadId = null] = data.split('_');
     const userId = callbackQuery.from.id;
     const username = callbackQuery.from.username;
+
+    let thread = threadId ? { message_thread_id: threadId } : {}
 
     const getUsernameFromId = async (userId) => {
         try {
@@ -319,7 +334,7 @@ bot.on('callback_query', async (callbackQuery) => {
         return;
     }
 
-    // Remove user from all lists
+    // Remove user from all list7s
     event.participants.go = event.participants.go.filter(id => id !== userId);
     event.participants.cantGo = event.participants.cantGo.filter(id => id !== userId);
     event.participants.late = event.participants.late.filter(id => id !== userId);
@@ -334,48 +349,136 @@ bot.on('callback_query', async (callbackQuery) => {
 
     saveEvent(chatId, eventId, event);
 
-    let responseText = `Event: ${event.title}\n${event.description}\nTime: ${event.time}\n\n`;
+    printEvent(chatId, event, thread);
 
-    responseText += `Go:\n`;
-    responseText += (await Promise.all(
-        event.participants.go.map(async (id, index) => {
-            const username = await getUsernameFromId(id);
-            return `${index + 1}. <a href="tg:\/\/user?id=${id}">${username}<\/a>`;
-        })
-    )).filter(username => username !== null).join('\n');
-    responseText += `\n\n`;
-    // responseText += `Go:\n${event.participants.go.map(id => `@${username}`).join('\n')}\n\n`;
-    responseText += `Can't go:\n`;
-    responseText += (await Promise.all(
-        event.participants.cantGo.map(async (id, index) => {
-            const username = await getUsernameFromId(id);
-            return `${index + 1}. <a href="tg:\/\/user?id=${id}">${username}<\/a>`;
-            // return `@${id}`;
-        })
-    )).filter(username => username !== null).join('\n');
-    responseText += `\n\n`;
-    //${event.participants.cantGo.map(id => `@${username}`).join('\n')}\n\n`;
-    responseText += `Attend but late:\n`
-        //${event.participants.late.map(id => `@${username}`).join('\n')}`;
-    responseText += (await Promise.all(
-        event.participants.late.map(async (id, index) => {
-            const username = await getUsernameFromId(id);
-            // return username ? `${username}` : null;
-            return `${index + 1}. <a href="tg:\/\/user?id=${id}">${username}<\/a>`;
+});
 
-        })
-    )).filter(username => username !== null).join('\n');
+bot.on('edited_message', async (msg) => {
 
+    const chatId = msg.chat.id;
+    const messageId = msg.message_id;
+    const threadId = msg.message_thread_id;
+    let thread = threadId ? { message_thread_id: threadId } : {}
+
+    // Load events for the chat
+    const events = loadEvents(chatId);
+    const event = events.find(event => event.originalMessageId === messageId);
+
+    if (event) {
+        const [title, description, time] = msg.text.replace('/create_event ', '').split('|').map(s => s.trim());
+        // console.error(`Event: `, event);
+        if (!title || !description || !time) {
+            console.error(`Error `, title, description, time);
+            bot.sendMessage(chatId, 'Please provide title, description, and time in the format: /create_event Title | Description | Time', thread);
+            return;
+        }
+
+        // Update event details
+        event.title = title;
+        event.description = description;
+        event.time = time;
+
+        saveEvent(chatId, event.id, event);
+        printEvent(chatId, event, thread);
+
+    }
+});
+
+
+bot.on('message', async (msg) => {
+    const chatId = msg.chat.id;
+    // const messageId = msg.message_id;
+    const userId = msg.from.id;
+    const threadId = msg.message_thread_id;
+    let thread = threadId ? { message_thread_id: threadId } : {}
+
+    if (msg.reply_to_message) {
+
+        const repliedMessageId = msg.reply_to_message.message_id;
+        const events = loadEvents(chatId);
+        const event = events.find(event => event.postMessageId === repliedMessageId);
+
+        if (event) {
+
+            if (
+                event.participants.go.includes(userId) ||
+                event.participants.cantGo.includes(userId) ||
+                event.participants.late.includes(userId)
+            ) {
+                if (event.comments === undefined) {
+                    event.comments = {}
+                }
+                event.comments[''+userId+''] = msg.text
+
+                saveEvent(chatId, event.id, event);
+                printEvent(chatId, event, thread);
+
+                bot.deleteMessage(chatId, msg.message_id)
+
+            } else {
+                bot.sendMessage(chatId, "You should attend to this event before you can comment", thread)
+                    .then((sentMessage) => {
+                        setTimeout(() => {
+                            bot.deleteMessage(chatId, sentMessage.message_id)
+                        }, 10000)
+
+                    });
+            }
+        }
+    }
+});
+
+// Helper function to format participant lists
+const formatParticipantList = function (participants, usernames, comments) {
+    return usernames.map((username, index) => {
+        let participantId = participants[index];
+        let str = `${index + 1}. <a href="tg://user?id=${participantId}">${username}</a>`;
+        if (comments.hasOwnProperty(participantId)) {
+            if (comments[participantId].trim().length > 0) {
+                str += ' ' + comments[participantId];
+            }
+        }
+        return str;
+    }).join('\n');
+}
+
+const getUsernameFromId = async (chatId, userId) => {
+    try {
+        const chatMember = await bot.getChatMember(chatId, userId);
+        return chatMember.user.username ? `@${chatMember.user.username}` : `${chatMember.user.first_name} ${chatMember.user.last_name || ''}`;
+    } catch (error) {
+        console.error(`Error fetching username for user ID ${userId}:`, error);
+        return null;
+    }
+};
+
+const printEvent = async (chatId, event, thread) => {
+    // Fetch usernames for participants
+    const goUsernames = await Promise.all(event.participants.go.map(id => getUsernameFromId(chatId, id)));
+    const cantGoUsernames = await Promise.all(event.participants.cantGo.map(id => getUsernameFromId(chatId, id)));
+    const lateUsernames = await Promise.all(event.participants.late.map(id => getUsernameFromId(chatId, id)));
+
+    // Format participant lists
+    const goList = formatParticipantList(event.participants.go, goUsernames, event.comments);
+    const cantGoList = formatParticipantList(event.participants.cantGo, cantGoUsernames, event.comments);
+    const lateList = formatParticipantList(event.participants.late, lateUsernames, event.comments);
+
+
+    // Update the event post text with participant lists
+    const responseText = `Event:\n${event.title}\n${event.description}\nTime: ${event.time}\n\nGoing:\n${goList}\n\nCan't Go:\n${cantGoList}\n\nLate:\n${lateList}`;
+    //
+    // // Edit the event post text
     bot.editMessageText(responseText, {
         chat_id: chatId,
-        message_id: callbackQuery.message.message_id,
+        message_id: event.postMessageId, // Store and use the message ID of the event post
+        ...thread,
         parse_mode: 'HTML',
         reply_markup: {
             inline_keyboard: [
-                [{ text: 'Go', callback_data: `go_${chatId}_${eventId}` }],
-                [{ text: 'Can\'t go', callback_data: `cantgo_${chatId}_${eventId}` }],
-                [{ text: 'Attend but late', callback_data: `late_${chatId}_${eventId}` }]
+                [{text: 'Go', callback_data: `go_${chatId}_${event.id}`}],
+                [{text: 'Can\'t go', callback_data: `cantgo_${chatId}_${event.id}`}],
+                [{text: 'Attend but late', callback_data: `late_${chatId}_${event.id}`}]
             ]
         }
     });
-});
+}
