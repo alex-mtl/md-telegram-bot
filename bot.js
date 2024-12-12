@@ -274,6 +274,8 @@ bot.onText(/\/create_event (.+)/, (msg, match) => {
         description,
         time,
         originalMessageId: msg.message_id,
+        addPlayerMsgId: null,
+        removePlayerMsgId: null,
         comments: {},
         participants: {
             go: [],
@@ -288,9 +290,11 @@ bot.onText(/\/create_event (.+)/, (msg, match) => {
         ...thread,
         reply_markup: {
             inline_keyboard: [
-                [{ text: 'Go', callback_data: `go_${chatId}_${eventId}` }],
-                [{ text: 'Can\'t go', callback_data: `cantgo_${chatId}_${eventId}` }],
-                [{ text: 'Attend but late', callback_data: `late_${chatId}_${eventId}` }]
+                [{ text: 'Go', callback_data: `go_${chatId}_${eventId}` },
+                { text: 'Can\'t go', callback_data: `cantgo_${chatId}_${eventId}` }],
+                [{ text: 'Attend but late', callback_data: `late_${chatId}_${eventId}` }],
+                [{ text: 'Add', callback_data: `add_${chatId}_${eventId}` },
+                { text: 'Remove', callback_data: `remove_${chatId}_${eventId}` }]
             ]
         }
     }).then((sentMessage) => {
@@ -313,7 +317,7 @@ bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
     const [action, chatId, eventId, threadId = null] = data.split('_');
     const userId = callbackQuery.from.id;
-    const username = callbackQuery.from.username;
+    // const username = callbackQuery.from.username;
 
     let thread = threadId ? { message_thread_id: threadId } : {}
 
@@ -341,15 +345,35 @@ bot.on('callback_query', async (callbackQuery) => {
 
     if (action === 'go') {
         event.participants.go.push(userId);
+        saveEvent(chatId, eventId, event);
+        printEvent(chatId, event, thread);
     } else if (action === 'cantgo') {
         event.participants.cantGo.push(userId);
+        saveEvent(chatId, eventId, event);
+        printEvent(chatId, event, thread);
     } else if (action === 'late') {
         event.participants.late.push(userId);
+        saveEvent(chatId, eventId, event);
+        printEvent(chatId, event, thread);
+    } else if (action === 'add') {
+        // bot.sendMessage(userId, 'Please enter the name or ID of the player to add:');
+        bot.sendMessage(chatId, 'Add player:', thread)
+            .then((sentMessage) => {
+                event.addPlayerMsgId = sentMessage.message_id
+                saveEvent(chatId, eventId, event);
+                printEvent(chatId, event, thread);
+            });
+    } else if (action === 'remove') {
+        // bot.sendMessage(userId, 'Please enter the name or ID of the player to add:');
+        bot.sendMessage(chatId, 'Remove player:', thread)
+            .then((sentMessage) => {
+                event.removePlayerMsgId = sentMessage.message_id
+                saveEvent(chatId, eventId, event);
+                printEvent(chatId, event, thread);
+            });
     }
 
-    saveEvent(chatId, eventId, event);
 
-    printEvent(chatId, event, thread);
 
 });
 
@@ -397,6 +421,8 @@ bot.on('message', async (msg) => {
         const repliedMessageId = msg.reply_to_message.message_id;
         const events = loadEvents(chatId);
         const event = events.find(event => event.postMessageId === repliedMessageId);
+        const eventAdd = events.find(event => event.addPlayerMsgId === repliedMessageId);
+        const eventRemove = events.find(event => event.removePlayerMsgId === repliedMessageId);
 
         if (event) {
 
@@ -413,7 +439,16 @@ bot.on('message', async (msg) => {
                 saveEvent(chatId, event.id, event);
                 printEvent(chatId, event, thread);
 
-                bot.deleteMessage(chatId, msg.message_id)
+                bot.deleteMessage(chatId, msg.message_id).catch((error) => {
+                    if (error.response.body.error_code === 400 && error.response.body.description.includes("message can't be deleted")) {
+                        console.log(msg.text)
+                        console.log("The message can't be deleted. It might be too old or already deleted.");
+                        // Handle the case, e.g., by logging or ignoring the error
+                    } else {
+                        // Handle other errors
+                        console.error("Failed to delete message:", error);
+                    }
+                });
 
             } else {
                 bot.sendMessage(chatId, "You should attend to this event before you can comment", thread)
@@ -424,6 +459,78 @@ bot.on('message', async (msg) => {
 
                     });
             }
+        } else if (eventAdd) {
+
+            if (
+                msg.text && (msg.text.trim() !== '')
+                && !eventAdd.participants.go.includes('#'+msg.text+'#')
+            ) {
+                eventAdd.participants.go.push('#'+msg.text+'#');
+                eventAdd.addPlayerMsgId = null;
+                saveEvent(chatId, eventAdd.id, eventAdd);
+                printEvent(chatId, eventAdd, thread);
+            }
+
+
+            bot.deleteMessage(chatId, msg.message_id).catch((error) => {
+                if (error.response.body.error_code === 400 && error.response.body.description.includes("message can't be deleted")) {
+                    console.log(msg.text)
+                    console.log("478 The message can't be deleted. It might be too old or already deleted.");
+                    // Handle the case, e.g., by logging or ignoring the error
+                } else {
+                    // Handle other errors
+                    console.error("Failed to delete message:", error);
+                }
+            });
+
+            bot.deleteMessage(chatId, repliedMessageId).catch((error) => {
+                if (error.response.body.error_code === 400 && error.response.body.description.includes("message can't be deleted")) {
+                    console.log(msg.text)
+                    console.log("489 The message can't be deleted. It might be too old or already deleted.");
+                    // Handle the case, e.g., by logging or ignoring the error
+                } else {
+                    // Handle other errors
+                    console.error("Failed to delete message:", error);
+                }
+            });
+        } else if (eventRemove) {
+
+            if (
+                msg.text && (msg.text.trim() !== '')
+                && eventRemove.participants.go.includes('#'+msg.text+'#')
+            ) {
+
+                eventRemove.participants.go = eventRemove.participants.go.filter(id => id !== '#'+msg.text+'#');
+                // eventRemove.participants.go.filter(function (id) {
+                //     return id !== ;
+                // });
+                eventRemove.removePlayerMsgId = null;
+                saveEvent(chatId, eventRemove.id, eventRemove);
+                printEvent(chatId, eventRemove, thread);
+            }
+
+
+            bot.deleteMessage(chatId, msg.message_id).catch((error) => {
+                if (error.response.body.error_code === 400 && error.response.body.description.includes("message can't be deleted")) {
+                    console.log(msg.text)
+                    console.log("512 The message can't be deleted. It might be too old or already deleted.");
+                    // Handle the case, e.g., by logging or ignoring the error
+                } else {
+                    // Handle other errors
+                    console.error("Failed to delete message:", error);
+                }
+            });
+
+            bot.deleteMessage(chatId, repliedMessageId).catch((error) => {
+                if (error.response.body.error_code === 400 && error.response.body.description.includes("message can't be deleted")) {
+                    console.log(msg.text)
+                    console.log("523 The message can't be deleted. It might be too old or already deleted.");
+                    // Handle the case, e.g., by logging or ignoring the error
+                } else {
+                    // Handle other errors
+                    console.error("Failed to delete message:", error);
+                }
+            });
         }
     }
 });
@@ -433,6 +540,10 @@ const formatParticipantList = function (participants, usernames, comments) {
     return usernames.map((username, index) => {
         let participantId = participants[index];
         let str = `${index + 1}. <a href="tg://user?id=${participantId}">${username}</a>`;
+        if (participantId.length >= 2 && participantId[0] === '#' && participantId[participantId.length - 1] === '#') {
+            str = `${index + 1}. ${username}`;
+        }
+
         if (comments.hasOwnProperty(participantId)) {
             if (comments[participantId].trim().length > 0) {
                 str += ' ' + comments[participantId];
@@ -444,8 +555,14 @@ const formatParticipantList = function (participants, usernames, comments) {
 
 const getUsernameFromId = async (chatId, userId) => {
     try {
-        const chatMember = await bot.getChatMember(chatId, userId);
-        return chatMember.user.username ? `@${chatMember.user.username}` : `${chatMember.user.first_name} ${chatMember.user.last_name || ''}`;
+        if (userId.length >= 2 && userId[0] === '#' && userId[userId.length - 1] === '#') {
+            const player = userId.slice(1, -1)
+            return player;
+        } else {
+            const chatMember = await bot.getChatMember(chatId, userId);
+            return chatMember.user.username ? `@${chatMember.user.username}` : `${chatMember.user.first_name} ${chatMember.user.last_name || ''}`;
+        }
+
     } catch (error) {
         console.error(`Error fetching username for user ID ${userId}:`, error);
         return null;
@@ -475,10 +592,18 @@ const printEvent = async (chatId, event, thread) => {
         parse_mode: 'HTML',
         reply_markup: {
             inline_keyboard: [
-                [{text: 'Go', callback_data: `go_${chatId}_${event.id}`}],
-                [{text: 'Can\'t go', callback_data: `cantgo_${chatId}_${event.id}`}],
-                [{text: 'Attend but late', callback_data: `late_${chatId}_${event.id}`}]
+                [{text: 'Go', callback_data: `go_${chatId}_${event.id}`},
+                {text: 'Can\'t go', callback_data: `cantgo_${chatId}_${event.id}`}],
+                [{text: 'Attend but late', callback_data: `late_${chatId}_${event.id}`}],
+                [{ text: 'Add', callback_data: `add_${chatId}_${event.id}` },
+                { text: 'Remove', callback_data: `remove_${chatId}_${event.id}` }]
             ]
+        }
+    }).catch(error => {
+        if (error.response.body.error_code === 400 && error.response.body.description.includes('message is not modified')) {
+            console.log('Attempted to modify a message with identical content.');
+        } else {
+            throw error; // or handle other errors
         }
     });
 }
