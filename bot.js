@@ -264,11 +264,12 @@ function loadEvents(chatId) {
         return loadEvent(chatId, eventId);
     }).filter(event => event !== null);
 }
-bot.onText(/\/create_event (.+)/s, (msg, match) => {
+// bot.onText(/\/create_event (.+)/s, (msg, match) => {
+bot.onText(/\/(create_event|event) (.+)/s, (msg, match) => {
     const chatId = msg.chat.id;
     const threadId = msg.message_thread_id;
     let thread = threadId ? { message_thread_id: threadId } : {}
-    const [title, description, time] = match[1].split('|').map(s => s.trim());
+    const [title, description, time] = match[2].split('|').map(s => s.trim());
 
     if (!title || !description || !time) {
         console.error(`Error `, title, description, time);
@@ -302,8 +303,9 @@ bot.onText(/\/create_event (.+)/s, (msg, match) => {
     };
 
     saveEvent(chatId, eventId, event);
+    const eventText = `📅 ${title}\n${description}\n🕗 ${time}\n\n🟢 Going:\n\n\n🔴 Can't Go:\n\n\n⏰ Late:\n`;
 
-    bot.sendMessage(chatId, `Event: \n${title}\n${description}\nTime: ${time}`, {
+    bot.sendMessage(chatId, eventText, {
         ...thread,
         reply_markup: {
             inline_keyboard: [
@@ -334,6 +336,7 @@ bot.onText(/\/create_event (.+)/s, (msg, match) => {
     //     });
     // });
 });
+
 
 bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
