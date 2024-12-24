@@ -233,6 +233,15 @@ function getEventFile(chatId, eventId) {
 }
 
 function saveEvent(chatId, eventId, event) {
+    if (!event.eventLink) {
+        formattedChatId = Math.abs(chatId).toString().slice(3);
+        if (event.thread?.message_thread_id) {
+
+            event.eventLink = `https://t.me/c/${formattedChatId}/${event.thread.message_thread_id}/${event.postMessageId ?? event.originalMessageId}`;
+        } else {
+            event.eventLink = `https://t.me/c/${formattedChatId}/${event.postMessageId ?? event.originalMessageId}`;
+        }
+    }
     const eventFile = getEventFile(chatId, eventId);
     fs.writeFileSync(eventFile, JSON.stringify(event), 'utf8');
 }
@@ -255,7 +264,7 @@ function loadEvents(chatId) {
         return loadEvent(chatId, eventId);
     }).filter(event => event !== null);
 }
-bot.onText(/\/create_event (.+)/, (msg, match) => {
+bot.onText(/\/create_event (.+)/s, (msg, match) => {
     const chatId = msg.chat.id;
     const threadId = msg.message_thread_id;
     let thread = threadId ? { message_thread_id: threadId } : {}
@@ -266,13 +275,21 @@ bot.onText(/\/create_event (.+)/, (msg, match) => {
         bot.sendMessage(chatId, 'Please provide title, description, and time in the format: /create_event Title | Description | Time', thread);
         return;
     }
+    formattedChatId = Math.abs(chatId).toString().slice(3);
+    let eventLink = `https://t.me/c/${formattedChatId}/${msg.message_id+1}`;
+    if (thread?.message_thread_id) {
+        eventLink = `https://t.me/c/${formattedChatId}/${thread.message_thread_id}/${msg.message_id+1}`;
+    }
 
     const eventId = new Date().getTime();
     const event = {
         id: eventId,
+        chatId,
+        thread,
         title,
         description,
         time,
+        eventLink,
         originalMessageId: msg.message_id,
         addPlayerMsgId: null,
         removePlayerMsgId: null,
@@ -294,15 +311,20 @@ bot.onText(/\/create_event (.+)/, (msg, match) => {
                 { text: 'Can\'t go', callback_data: `cantgo_${chatId}_${eventId}` }],
                 [{ text: 'Attend but late', callback_data: `late_${chatId}_${eventId}` }],
                 [{ text: 'Add', callback_data: `add_${chatId}_${eventId}` },
-                { text: 'Remove', callback_data: `remove_${chatId}_${eventId}` }]
+                { text: 'Remove', callback_data: `remove_${chatId}_${eventId}` }],
+                [{ text: `${eventLink}`, url: `${eventLink}` }]
             ]
         }
     }).then((sentMessage) => {
         bot.pinChatMessage(chatId, sentMessage.message_id);
         event.postMessageId = sentMessage.message_id; // Store the event post message ID
+        formattedChatId = Math.abs(event.chatId).toString().slice(3);
+        event.eventLink = `https://t.me/c/${formattedChatId}/${sentMessage.message_id}`;
+        if (event.thread?.message_thread_id) {
+            event.eventLink = `https://t.me/c/${formattedChatId}/${event.thread.message_thread_id}/${sentMessage.message_id}`;
+        }
         saveEvent(chatId, eventId, event);
     });
-
     // schedule.scheduleJob(new Date(Date.parse(time) - 10 * 60 * 1000), () => {
     //     event.participants.go.forEach(userId => {
     //         bot.sendMessage(userId, `Your event "${title}" starts in 10 minutes.`);
@@ -318,8 +340,8 @@ bot.on('callback_query', async (callbackQuery) => {
     const [action, chatId, eventId, threadId = null] = data.split('_');
     const userId = callbackQuery.from.id;
     // const username = callbackQuery.from.username;
-
     let thread = threadId ? { message_thread_id: threadId } : {}
+    let realThread = callbackQuery.message.message_thread_id ? { message_thread_id: callbackQuery.message.message_thread_id } : {}
 
     const getUsernameFromId = async (userId) => {
         try {
@@ -339,9 +361,11 @@ bot.on('callback_query', async (callbackQuery) => {
     }
 
     // Remove user from all list7s
-    event.participants.go = event.participants.go.filter(id => id !== userId);
-    event.participants.cantGo = event.participants.cantGo.filter(id => id !== userId);
-    event.participants.late = event.participants.late.filter(id => id !== userId);
+    if (['go', 'cantgo', 'late'].includes(action) ) {
+        event.participants.go = event.participants.go.filter(id => id !== userId);
+        event.participants.cantGo = event.participants.cantGo.filter(id => id !== userId);
+        event.participants.late = event.participants.late.filter(id => id !== userId);
+    }
 
     if (action === 'go') {
         event.participants.go.push(userId);
@@ -357,15 +381,23 @@ bot.on('callback_query', async (callbackQuery) => {
         printEvent(chatId, event, thread);
     } else if (action === 'add') {
         // bot.sendMessage(userId, 'Please enter the name or ID of the player to add:');
-        bot.sendMessage(chatId, 'Add player:', thread)
+        bot.sendMessage(chatId, 'Add player:', realThread)
             .then((sentMessage) => {
                 event.addPlayerMsgId = sentMessage.message_id
                 saveEvent(chatId, eventId, event);
-                printEvent(chatId, event, thread);
+                printEvent(event.chatId, event, thread);
+            });
+    } else if (action === 'link') {
+        // bot.sendMessage(userId, 'Please enter the name or ID of the player to add:');
+        bot.sendMessage(chatId, 'Add player:', realThread)
+            .then((sentMessage) => {
+                event.addPlayerMsgId = sentMessage.message_id
+                saveEvent(chatId, eventId, event);
+                printEvent(event.chatId, event, thread);
             });
     } else if (action === 'remove') {
         // bot.sendMessage(userId, 'Please enter the name or ID of the player to add:');
-        bot.sendMessage(chatId, 'Remove player:', thread)
+        bot.sendMessage(chatId, 'Remove player:', realThread)
             .then((sentMessage) => {
                 event.removePlayerMsgId = sentMessage.message_id
                 saveEvent(chatId, eventId, event);
@@ -582,7 +614,7 @@ const printEvent = async (chatId, event, thread) => {
 
 
     // Update the event post text with participant lists
-    const responseText = `Event:\n${event.title}\n${event.description}\nTime: ${event.time}\n\nGoing:\n${goList}\n\nCan't Go:\n${cantGoList}\n\nLate:\n${lateList}`;
+    const responseText = `📅 ${event.title}\n${event.description}\n🕗 ${event.time}\n\n🟢 Going:\n${goList}\n\n🔴 Can't Go:\n${cantGoList}\n\n⏰ Late:\n${lateList}`;
     //
     // // Edit the event post text
     bot.editMessageText(responseText, {
@@ -596,7 +628,8 @@ const printEvent = async (chatId, event, thread) => {
                 {text: 'Can\'t go', callback_data: `cantgo_${chatId}_${event.id}`}],
                 [{text: 'Attend but late', callback_data: `late_${chatId}_${event.id}`}],
                 [{ text: 'Add', callback_data: `add_${chatId}_${event.id}` },
-                { text: 'Remove', callback_data: `remove_${chatId}_${event.id}` }]
+                { text: 'Remove', callback_data: `remove_${chatId}_${event.id}` }],
+                [{ text: `${event.eventLink}`, url: `${event.eventLink}` }]
             ]
         }
     }).catch(error => {
