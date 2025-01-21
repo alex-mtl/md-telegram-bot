@@ -11,6 +11,36 @@ const bot = new TelegramBot(TOKEN, { polling: true });
 // Directory to store the group member files
 const GROUP_DIR = 'groups';
 
+
+async function checkDeleteMessagePermission(chatId) {
+    try {
+        const botInfo = await bot.getChatMember(chatId, (await bot.getMe()).id);
+
+        if (botInfo.status === 'administrator') {
+            const canDeleteMessages = botInfo.can_delete_messages;
+            console.log(`Can delete messages: ${canDeleteMessages}`);
+            errMess = (canDeleteMessages
+                ? 'Bot has permission to delete messages.'
+                : 'Bot has no permission to delete messages.');
+            console.log(`Err:`+errMess);
+            return {
+                canDeleteMessages,
+                errMessage: errMess,
+            };
+        } else {
+            return {
+                canDeleteMessages: false,
+                errMessage: 'Bot is not an administrator.',
+            };
+        }
+    } catch (error) {
+        console.error('Error checking permissions:', error.message);
+        return {
+            canDeleteMessages: false,
+            errMessage: 'Error checking permissions: ' + error.message,
+        };
+    }
+}
 function getGroupFile(chatId) {
     return path.join(GROUP_DIR, `${chatId}.json`);
 }
@@ -32,6 +62,10 @@ function saveGroup(chatId, group) {
     fs.writeFileSync(groupFile, JSON.stringify([...group]), 'utf8');
 }
 
+bot.on('polling_error', (error) => {
+    console.error(`Polling error: ${error.message}`);
+    // Optionally, implement a retry mechanism or delay to prevent constant retries.
+});
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
@@ -264,8 +298,9 @@ function loadEvents(chatId) {
         return loadEvent(chatId, eventId);
     }).filter(event => event !== null);
 }
+
 // bot.onText(/\/create_event (.+)/s, (msg, match) => {
-bot.onText(/\/(create_event|event) (.+)/s, (msg, match) => {
+bot.onText(/\/(create_event|event) (.+)/s, async (msg, match) => {
     const chatId = msg.chat.id;
     const threadId = msg.message_thread_id;
     let thread = threadId ? { message_thread_id: threadId } : {}
@@ -274,6 +309,12 @@ bot.onText(/\/(create_event|event) (.+)/s, (msg, match) => {
     if (!title || !description || !time) {
         console.error(`Error `, title, description, time);
         bot.sendMessage(chatId, 'Please provide title, description, and time in the format: /create_event Title | Description | Time', thread);
+        return;
+    }
+
+    const { canDeleteMessages, errMessage } = await checkDeleteMessagePermission(chatId);
+    if (!canDeleteMessages ) {
+        bot.sendMessage(chatId, errMessage, thread);
         return;
     }
     formattedChatId = Math.abs(chatId).toString().slice(3);
@@ -292,6 +333,7 @@ bot.onText(/\/(create_event|event) (.+)/s, (msg, match) => {
         time,
         eventLink,
         originalMessageId: msg.message_id,
+        authorId: msg.from.id,
         addPlayerMsgId: null,
         removePlayerMsgId: null,
         comments: {},
@@ -325,7 +367,28 @@ bot.onText(/\/(create_event|event) (.+)/s, (msg, match) => {
         if (event.thread?.message_thread_id) {
             event.eventLink = `https://t.me/c/${formattedChatId}/${event.thread.message_thread_id}/${sentMessage.message_id}`;
         }
-        saveEvent(chatId, eventId, event);
+        bot.sendMessage(msg.from.id, msg.text, {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    //[{text: 'Edit', callback_data: `edit_${chatId}_${eventId}`}],
+                    [{text: `${eventLink}`, url: `${eventLink}`}],
+                    [
+                        { text: 'Edit', switch_inline_query_current_chat: `edit:${chatId}:${eventId}: ${event.title}|${event.description}|${event.time}` }
+                    ]
+                ]
+            }
+        }).then((sentAuthorMessage) => {
+                bot.deleteMessage(chatId, event.originalMessageId);
+                console.log('347', sentAuthorMessage.chatId, msg.from.id, sentAuthorMessage.chat);
+
+                event.chatBotId = sentAuthorMessage.chat.id;
+                event.authorId = msg.from.id;
+                event.version = '1.51'
+                event.originalMessageId = sentAuthorMessage.message_id
+                saveEvent(chatId, eventId, event);
+            })
+
     });
     // schedule.scheduleJob(new Date(Date.parse(time) - 10 * 60 * 1000), () => {
     //     event.participants.go.forEach(userId => {
@@ -412,6 +475,53 @@ bot.on('callback_query', async (callbackQuery) => {
 
 });
 
+//
+bot.onText(/@MaoDaoBot edit:(-\d+):(\d+):(.*)/s, (msg, match) => {
+    console.log(match, msg.from.id)
+// bot.on('edited_message', async (msg) => {
+    const chatId = match[1];
+    const eventId = match[2];
+    const newContent = match[3];
+    const event =  loadEvent(chatId, eventId);
+    console.log('442',event)
+
+    if (event.id !== eventId || msg.from.id !== event.authorId) {
+    // const chatId = msg.chat.id;
+    // const messageId = msg.message_id;
+    // const threadId = msg.message_thread_id;
+    // let thread = threadId ? { message_thread_id: threadId } : {}
+
+    // Load events for the chat
+
+        const [title, description, time] = newContent.split('|').map(s => s.trim());
+
+        // console.error(`Event: `, event);
+        if (!title || !description || !time) {
+            bot.sendMessage(msg.from.id, 'Invalid format', );
+            return;
+        }
+
+        // let thread = event.threadthreadId ? { message_thread_id: threadId } : {}
+        // Update event details
+        event.title = title;
+        event.description = description;
+        event.time = time;
+
+        saveEvent(chatId, event.id, event);
+        printEvent(chatId, event, event.thread);
+        bot.deleteMessage(msg.chat.id, msg.message_id);
+    } else {
+
+        console.log('Event id:'+eventId+' not found in group:'+chatId)
+        console.log(event.id,eventId,msg.from.id, event.authorId)
+    }
+});
+
+// bot.onText(/@MaoDaoBot edit:(-\d+)/, (msg, match) => {
+// // bot.onText(/@MaoDaoBot edit:(\d+):(\d+):(.*)/, (msg, match) => {
+//         console.log(match)
+//
+// });
 bot.on('edited_message', async (msg) => {
 
     const chatId = msg.chat.id;
@@ -424,7 +534,8 @@ bot.on('edited_message', async (msg) => {
     const event = events.find(event => event.originalMessageId === messageId);
 
     if (event) {
-        const [title, description, time] = msg.text.replace('/create_event ', '').split('|').map(s => s.trim());
+        const [title, description, time] = msg.text.replace(/^\/(?:create_event|event)\s*/, '').split('|').map(s => s.trim());
+
         // console.error(`Event: `, event);
         if (!title || !description || !time) {
             console.error(`Error `, title, description, time);
@@ -642,4 +753,21 @@ const printEvent = async (chatId, event, thread) => {
             throw error; // or handle other errors
         }
     });
+
+    if (event.version >= '1.51') {
+        bot.editMessageText(`/event ${event.title}|${event.description}|${event.time}`, {
+            chat_id: event.chatBotId,
+            message_id: event.originalMessageId, // Store and use the message ID of the event post
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    [{text: `${event.eventLink}`, url: `${event.eventLink}`}],
+                    [
+                        { text: 'Edit', switch_inline_query_current_chat: `edit:${chatId}:${event.id}: ${event.title}|${event.description}|${event.time}` }
+                    ]
+                ]
+            }
+        })
+    }
+
 }
