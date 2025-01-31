@@ -219,7 +219,7 @@ bot.onText(/\/notify_all\s+((.|\n)+)/, (msg, match) => {
         bot.sendMessage(chatId, 'Please provide a message to send.', thread);
         return;
     }
-    bot.getChat(chatId).then(chat => {
+    bot.getChat(chatId).then(async (chat) => {
         // const chatName = chat.title || chat.username || chat.first_name || chat.last_name;
         const chatName = msg.chat.username;
         let messageId = msg.message_id
@@ -240,10 +240,37 @@ bot.onText(/\/notify_all\s+((.|\n)+)/, (msg, match) => {
         }
 
 
-        group.forEach(memberId => {
-            bot.sendMessage(memberId, `@${username}: ${message} (${messageLink})`);
-        });
+        // group.forEach(memberId => {
+        //     bot.sendMessage(memberId, `@${username}: ${message} (${messageLink})`);
+        const memberIds = Array.from(group);
+        let permissionDenied = ''
+        console.log(memberIds);
+        await Promise.all(
+            memberIds.map(async (memberId) => {
+                try {
+                    await bot.sendMessage(memberId, `@${username}: ${message} (${messageLink})`);
+                    // await bot.sendMessage(userId, message);
+                    console.log(`Message sent to user ${memberId}`);
+                    return true; // Message successfully sent
+                } catch (error) {
+                    if (error.response && error.response.statusCode === 403) {
 
+                        const chatMember = await bot.getChatMember(chatId, memberId);
+                        let mention = chatMember.user.username ? `@${chatMember.user.username} ` : `${chatMember.user.first_name} ${chatMember.user.last_name || ''} `;
+                        console.error(`Cannot send message to user ${memberId} ${mention}: ${error.response.body.description}`);
+                        permissionDenied = permissionDenied + mention
+
+                    } else {
+                        console.error(`Failed to send message to user ${memberId}:`, error.message);
+                    }
+                    return false; // Message failed
+                }
+
+            })
+        )
+        if (permissionDenied.length > 2) {
+            bot.sendMessage(chatId, permissionDenied + ` do not have permission to receive direct messages from the bot.`, thread);
+        }
         bot.sendMessage(chatId, 'Message sent to all group members.', thread);
     }).catch(err => {
         console.error(err);
@@ -522,6 +549,69 @@ bot.onText(/@MaoDaoBot edit:(-\d+):(\d+):(.*)/s, (msg, match) => {
 //         console.log(match)
 //
 // });
+
+// bot.on('new_chat_members', (msg) => {
+//     const chatId = msg.chat.id;
+//     const userId = msg.from.id;
+//     const threadId = msg.message_thread_id;
+//     let thread = threadId ? { message_thread_id: threadId } : {}
+//
+//     bot.sendMessage(
+//         chatId,
+//         `Welcome! Please click [here](https://t.me/MaoDaoBot?start=from_group) to start interacting with me in private chat.`,
+//         { parse_mode: 'Markdown', ...thread }
+//     );
+//
+//
+//     const group = loadGroup(chatId);
+//     if (!group.has(userId)) {
+//         group.add(userId);
+//         saveGroup(chatId, group);
+//         bot.getChat(chatId).then(chat => {
+//             const chatName = chat.title || chat.username || chat.first_name || chat.last_name;
+//             bot.sendMessage(chatId, `You have joined the "all" group in chat: ${chatName}`, thread);
+//         }).catch(err => {
+//             bot.sendMessage(userId, `You have joined the "all" group in chat: ${chatId}`);
+//             console.error(err);
+//         });
+//     } else {
+//         bot.sendMessage(chatId, 'You are already a member of the "all" group.', thread);
+//     }
+// });
+
+bot.on('new_chat_members', (msg) => {
+    const chatId = msg.chat.id;
+    const threadId = msg.message_thread_id;
+    let thread = threadId ? { message_thread_id: threadId } : {};
+
+    msg.new_chat_members.forEach((newMember) => {
+        const userId = newMember.id; // Get the correct user ID
+
+        bot.sendMessage(
+            chatId,
+            `Welcome, ${newMember.first_name}! Please click [here](https://t.me/MaoDaoBot?start=from_group) to start interacting with me in private chat.`,
+            { parse_mode: 'Markdown', ...thread }
+        );
+
+        const group = loadGroup(chatId);
+        if (!group.has(userId)) {
+            group.add(userId);
+            saveGroup(chatId, group);
+
+            bot.getChat(chatId).then(chat => {
+                const chatName = chat.title || chat.username || chat.first_name || chat.last_name;
+                bot.sendMessage(chatId, `${newMember.first_name}, you have joined the "all" group in chat: ${chatName}`, thread);
+            }).catch(err => {
+                bot.sendMessage(userId, `You have joined the "all" group in chat: ${chatId}`);
+                console.error(err);
+            });
+        } else {
+            bot.sendMessage(chatId, `${newMember.first_name}, you are already a member of the "all" group.`, thread);
+        }
+    });
+});
+
+
 bot.on('edited_message', async (msg) => {
 
     const chatId = msg.chat.id;
