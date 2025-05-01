@@ -1,4 +1,5 @@
 const TelegramBot = require('node-telegram-bot-api');
+const cron = require('node-cron');
 const fs = require('fs');
 const path = require('path');
 
@@ -30,7 +31,7 @@ async function checkDeleteMessagePermission(chatId) {
         } else {
             return {
                 canDeleteMessages: false,
-                errMessage: 'Bot is not an administrator.',
+                errMessage: 'Bot is not an administrator. '+botInfo.status,
             };
         }
     } catch (error) {
@@ -74,7 +75,7 @@ bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id, 'Hi! Use /join_all to join the group, /leave_all to leave the group, and /notify_all <message> to notify all members.', thread);
 });
 
-bot.onText(/\/join_all/, (msg) => {
+bot.onText(/\/(join_all|join)/, (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
     const threadId = msg.message_thread_id;
@@ -95,19 +96,35 @@ bot.onText(/\/join_all/, (msg) => {
     }
 });
 
-bot.onText(/\/leave_all/, (msg) => {
+bot.onText(/\/(leave_all|leave)/, (msg) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
+    const messageId = msg.message_id;
     const threadId = msg.message_thread_id;
     let thread = threadId ? { message_thread_id: threadId } : {}
     const group = loadGroup(chatId);
+
+    let replyText = '';
+
     if (group.has(userId)) {
         group.delete(userId);
         saveGroup(chatId, group);
-        bot.sendMessage(chatId, 'You have left the "all" group.', thread);
+        replyText = 'You have left the "all" group.';
     } else {
-        bot.sendMessage(chatId, 'You are not a member of the "all" group.', thread);
+        replyText = 'You are not a member of the "all" group.';
     }
+
+    bot.sendMessage(chatId, replyText, thread).then((sentMsg) => {
+        // Удалить оба сообщения через 20 секунд
+        setTimeout(() => {
+            bot.deleteMessage(chatId, messageId).catch(err =>
+                console.warn('Failed to delete user message:', err.message)
+            );
+            bot.deleteMessage(chatId, sentMsg.message_id).catch(err =>
+                console.warn('Failed to delete bot reply:', err.message)
+            );
+        }, 5000);
+    });
 });
 
 bot.onText(/\/add_all\s+(@\w+(\s+@\w+)*)/, async (msg, match) => {
@@ -293,6 +310,14 @@ function getEventFile(chatId, eventId) {
     return path.join(EVENT_DIR, `${chatId}_${eventId}.json`);
 }
 
+function getGSFile(chatId) {
+    return path.join(GROUP_DIR, `${chatId}.settings.json`);
+}
+
+function saveGS(chatId, settings) {
+    const gsFile = getGSFile(chatId);
+    fs.writeFileSync(gsFile, JSON.stringify(settings), 'utf8');
+}
 function saveEvent(chatId, eventId, event) {
     if (!event.eventLink) {
         formattedChatId = Math.abs(chatId).toString().slice(3);
@@ -316,6 +341,15 @@ function loadEvent(chatId, eventId) {
     return null;
 }
 
+function loadGS(chatId) {
+    const gsFile = getGSFile(chatId);
+    if (fs.existsSync(gsFile)) {
+        const data = fs.readFileSync(gsFile, 'utf8');
+        return JSON.parse(data);
+    }
+    return {};
+}
+
 function loadEvents(chatId) {
     const eventsDir = path.join(__dirname, 'events');
     const eventFiles = fs.readdirSync(eventsDir).filter(file => file.startsWith(`${chatId}_`));
@@ -325,6 +359,181 @@ function loadEvents(chatId) {
         return loadEvent(chatId, eventId);
     }).filter(event => event !== null);
 }
+
+function remindJoinEvent(chatId, eventId) {
+    const event = loadEvent(chatId, eventId);
+
+    if (!event) {
+        bot.sendMessage(chatId, 'Event not found.');
+        return;
+    }
+
+    const group = loadGroup(chatId);
+
+    const respondedUsers = new Set([
+        ...event.participants.go,
+        ...event.participants.cantGo,
+        ...event.participants.late
+    ]);
+
+    const notResponded = Array.from(group).filter(userId => !respondedUsers.has(userId));
+
+    let permissionDenied = '';
+
+    bot.getChat(chatId).then(chat => {
+        const chatName = chat.title || chat.username || chat.first_name || chat.last_name;
+        Promise.all(notResponded.map(async (userId) => {
+            try {
+                const oldMessageId = event.remindMsgs?.[userId];
+                console.log(event.remindMsgs)
+                if (oldMessageId) {
+                    await bot.deleteMessage(userId, oldMessageId).catch(err => {
+                        console.warn(`Could not delete old reminder for ${userId}:`, err.message);
+                    });
+                }
+
+                // Отправляем новое напоминание
+                // const sentMessage = await bot.sendMessage(userId, `${chatName}\n\nYou haven't responded to the event "${event.title}".\nPlease check it out here: ${event.eventLink}`);
+                const goUsernames = await Promise.all(event.participants.go.map(id => getUsernameFromId(chatId, id)));
+                const cantGoUsernames = await Promise.all(event.participants.cantGo.map(id => getUsernameFromId(chatId, id)));
+                const lateUsernames = await Promise.all(event.participants.late.map(id => getUsernameFromId(chatId, id)));
+
+                const goList = formatParticipantList(event.participants.go, goUsernames, event.comments);
+                const cantGoList = formatParticipantList(event.participants.cantGo, cantGoUsernames, event.comments);
+                const lateList = formatParticipantList(event.participants.late, lateUsernames, event.comments);
+
+
+                // Update the event post text with participant lists
+                const responseText = `📅 ${event.title}\n${event.description}\n🕗 ${event.time}\n\n🟢 Going:\n${goList}\n\n🔴 Can't Go:\n${cantGoList}\n\n⏰ Late:\n${lateList}`;
+
+                const sentMessage = await bot.sendMessage(
+                    userId,
+                    `<b>${chatName}</b>\n\nYou haven't responded to the event \n\n${responseText}\n\nPlease check it out <a href="${event.eventLink}">here</a>.`,
+                    { parse_mode: 'HTML' }
+                );
+
+                // Обновляем remindMsgs
+                if (!event.remindMsgs) event.remindMsgs = {};
+                event.remindMsgs[userId] = sentMessage.message_id;
+                saveEvent(chatId, eventId, event);
+                // await bot.sendMessage(userId, `${chatName}\n\nYou haven't responded to the event "${event.title}".\nPlease check it out here: ${event.eventLink}`);
+                // console.log(`${chatName}: Reminder sent to user ${userId}`);
+            } catch (error) {
+                if (error.response && error.response.statusCode === 403) {
+                    try {
+                        const chatMember = await bot.getChatMember(chatId, userId);
+                        const mention = chatMember.user.username
+                            ? `@${chatMember.user.username}`
+                            : `${chatMember.user.first_name} ${chatMember.user.last_name || ''}`;
+                        //console.log(`${chatName}: Cannot DM user ${userId}: ${mention}`);
+                        permissionDenied += mention + ' ';
+                    } catch (innerErr) {
+                        console.error(`Failed to fetch user ${userId}:`, innerErr);
+                    }
+                } else {
+                    console.error(`${chatName}: Failed to send reminder to user ${userId}:`, error.message);
+                }
+            }
+        })).then(() => {
+            if (permissionDenied.trim().length > 0) {
+                console.error(`${chatName}: ${permissionDenied} cannot receive private messages from the bot.`);
+            }
+        }).catch(err => {
+            console.error(`${chatName}: Error sending reminders:`, err);
+        });
+    }).catch(err => {
+        console.error('341:',err);
+    });
+
+}
+
+bot.on('channel_post', async (msg) => {
+    console.log(msg); // Посмотри, какие данные приходят
+
+    const text = msg.text || '';
+    const match = text.match(/\/(create_event|event) (.+)/s);
+
+    if (match) {
+        const [title, description, time] = match[2].split('|').map(s => s.trim());
+
+        await bot.sendMessage(msg.chat.id, `Создано событие: ${title} -+- ${description} -+- ${time}`);
+    }
+});
+
+bot.onText(/\/tz/, async (msg) => {
+    const chatId = msg.chat.id;
+    const threadId = msg.message_thread_id;
+    let thread = threadId ? { message_thread_id: threadId } : {}
+    const chatType = msg.chat.type;
+
+    if (chatType === 'private') {
+        bot.sendMessage(chatId, 'Please run this command in group chat. It makes no sense here')
+            .then((sentMessage) => {
+            setTimeout(() => {
+                bot.deleteMessage(chatId, sentMessage.message_id)
+            }, 10000)
+
+        });
+
+    } else {
+        const userId = msg.from.id;
+
+        try {
+            const member = await bot.getChatMember(chatId, userId);
+
+            if (['administrator', 'creator'].includes(member.status)) {
+                const timezones = [];
+                for (let i = -11; i <= 12; i++) {
+                    const sign = i >= 0 ? '+' : '-';
+                    const absVal = Math.abs(i).toString().padStart(2, '0');
+                    const offset = `${sign}${absVal}`;
+                    timezones.push({ text: `${offset}`, callback_data: `tz_${chatId}|${offset}` });
+                }
+
+                // Формируем клавиатуру с 6 кнопками в строке
+                const keyboard = [];
+                for (let i = 0; i < timezones.length; i += 6) {
+                    keyboard.push(timezones.slice(i, i + 6));
+                }
+
+                bot.sendMessage(chatId, 'Select your group time zone (UTC+/-):', {
+                    ...thread,
+                    reply_markup: {
+                        inline_keyboard: keyboard
+                    }
+                })
+                    .then((sentMessage) => {
+                        bot.deleteMessage(chatId, msg.message_id)
+                        setTimeout(() => {
+
+                            bot.deleteMessage(chatId, sentMessage.message_id)
+                        }, 120000)
+
+                    });
+            } else {
+                // Пользователь обычный участник
+                bot.sendMessage(chatId, 'Only admins can set the timezone.')
+                    .then((sentMessage) => {
+                        bot.deleteMessage(chatId, msg.message_id)
+                        setTimeout(() => {
+
+                            bot.deleteMessage(chatId, sentMessage.message_id)
+                        }, 5000)
+                    });
+            }
+        } catch (error) {
+            console.error('525 Error checking admin status:', error);
+            bot.sendMessage(chatId, 'Error checking your permissions.')
+                .then((sentMessage) => {
+                    bot.deleteMessage(chatId, msg.message_id)
+                    setTimeout(() => {
+                        bot.deleteMessage(chatId, sentMessage.message_id)
+                    }, 5000)
+            });
+        }
+    }
+
+});
 
 // bot.onText(/\/create_event (.+)/s, (msg, match) => {
 bot.onText(/\/(create_event|event) (.+)/s, async (msg, match) => {
@@ -364,6 +573,8 @@ bot.onText(/\/(create_event|event) (.+)/s, async (msg, match) => {
         addPlayerMsgId: null,
         removePlayerMsgId: null,
         comments: {},
+        remindMsgs: {},
+        remindJoin: 0,
         participants: {
             go: [],
             cantGo: [],
@@ -394,6 +605,11 @@ bot.onText(/\/(create_event|event) (.+)/s, async (msg, match) => {
         if (event.thread?.message_thread_id) {
             event.eventLink = `https://t.me/c/${formattedChatId}/${event.thread.message_thread_id}/${sentMessage.message_id}`;
         }
+        const reminderOptions = [0, 4, 6, 8, 12];
+        const reminderButtons = reminderOptions.map(h => ({
+            text: `${(event.remindJoin ?? 0)=== h ? '🟩' : '⬜️'}${h === 0 ? '0' : h + 'h'}`,
+            callback_data: `remindJoin_${chatId}_${event.id}|${h}`
+        }));
         bot.sendMessage(msg.from.id, msg.text, {
             parse_mode: 'HTML',
             reply_markup: {
@@ -402,12 +618,17 @@ bot.onText(/\/(create_event|event) (.+)/s, async (msg, match) => {
                     [{text: `${eventLink}`, url: `${eventLink}`}],
                     [
                         { text: 'Edit', switch_inline_query_current_chat: `edit:${chatId}:${eventId}: ${event.title}|${event.description}|${event.time}` }
-                    ]
+                    ],
+                    [
+                        { text: 'Remind to join every X hours:', callback_data: 'noop' }
+                    ],
+                    reminderButtons
+
                 ]
             }
         }).then((sentAuthorMessage) => {
                 bot.deleteMessage(chatId, event.originalMessageId);
-                console.log('347', sentAuthorMessage.chatId, msg.from.id, sentAuthorMessage.chat);
+                console.log('347', sentAuthorMessage.chat.id, msg.from.id, sentAuthorMessage.chat);
 
                 event.chatBotId = sentAuthorMessage.chat.id;
                 event.authorId = msg.from.id;
@@ -427,10 +648,15 @@ bot.onText(/\/(create_event|event) (.+)/s, async (msg, match) => {
     // });
 });
 
-
+const cronJobs = new Map();
 bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
-    const [action, chatId, eventId, threadId = null] = data.split('_');
+    const [mainPart, argPart] = data.split('|');
+    const [action, chatId, eventId, threadId = null] = mainPart.split('_');
+//    const args = argPart.split('_');
+    const args = (argPart ?? '').split('_');
+    console.log(data, 'args:', args)
+
     const userId = callbackQuery.from.id;
     // const username = callbackQuery.from.username;
     let thread = threadId ? { message_thread_id: threadId } : {}
@@ -448,7 +674,7 @@ bot.on('callback_query', async (callbackQuery) => {
 
     const event = loadEvent(chatId, eventId);
 
-    if (!event) {
+    if (!event && action !== 'tz') {
         bot.sendMessage(chatId, 'Event not found.');
         return;
     }
@@ -464,6 +690,48 @@ bot.on('callback_query', async (callbackQuery) => {
         event.participants.go.push(userId);
         saveEvent(chatId, eventId, event);
         printEvent(chatId, event, thread);
+    } else if (action === 'tz') {
+        const groupSettings = loadGS(chatId);
+        groupSettings.tz = args[0] ?? groupSettings?.tz ?? "-04";
+        saveGS(chatId, groupSettings);
+
+    } else if (action === 'remindJoin') {
+        // let freq = parseInt(args[1] ?? 0)
+        let freq = parseInt(args[0] ?? 0)
+        console.log(`554: event.remindJoin = freq = ${freq}`)
+        event.remindJoin = freq;
+        event.reminder ??= {};
+        console.log(event)
+        const jobKey = `${chatId}_${eventId}`;
+        // Stop old job if exists
+        if (cronJobs.has(jobKey)) {
+            const job = cronJobs.get(jobKey);
+            job.stop();      // Stop the job
+            cronJobs.delete(jobKey);  // Remove from the list
+        }
+
+        // if (event?.reminder?.join) {
+        //     event.reminder.join.stop();
+        //     event.reminder.join = null;
+        // }
+        if ([4, 6, 8, 12].includes(freq)) {
+            if (eventId == '1745143303069') {
+                job =  cron.schedule(`*/${freq} * * * *`, () => {
+                    remindJoinEvent(chatId, eventId)
+                    console.log('Freq reminder set to '+freq);
+                });
+            } else {
+                job =  cron.schedule(`0 */${freq} * * *`, () => {
+                    remindJoinEvent(chatId, eventId)
+                    console.log('Freq reminder set to '+freq);
+                });
+            }
+
+            cronJobs.set(jobKey, job);
+        }
+        saveEvent(chatId, eventId, event);
+        printEvent(chatId, event, thread);
+
     } else if (action === 'cantgo') {
         event.participants.cantGo.push(userId);
         saveEvent(chatId, eventId, event);
@@ -543,6 +811,52 @@ bot.onText(/@MaoDaoBot edit:(-\d+):(\d+):(.*)/s, (msg, match) => {
         console.log(event.id,eventId,msg.from.id, event.authorId)
     }
 });
+
+bot.onText(/\/callme (.+)/, (msg, match) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const newNickname = match[1].trim();
+    const threadId = msg.message_thread_id;
+    const messageId = msg.message_id;
+    let thread = threadId ? { message_thread_id: threadId } : {};
+
+    if (!newNickname) {
+        bot.sendMessage(chatId, 'Please provide a nickname.', thread).then(sent => {
+            setTimeout(() => {
+                bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+                bot.deleteMessage(chatId, messageId).catch(() => {});
+            }, 5000);
+        });
+        return;
+    }
+
+    if (newNickname.length > 64) {
+        bot.sendMessage(chatId, 'Nickname is too long. Maximum allowed length is 64 characters.', thread).then(sent => {
+            setTimeout(() => {
+                bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+                bot.deleteMessage(chatId, messageId).catch(() => {});
+            }, 5000);
+        });
+        return;
+    }
+
+    const groupSettings = loadGS(chatId);
+    if (!groupSettings.nicknames) {
+        groupSettings.nicknames = {};
+    }
+
+    groupSettings.nicknames[userId] = newNickname;
+    saveGS(chatId, groupSettings);
+
+    bot.sendMessage(chatId, `Your nickname has been set to: ${newNickname}`, thread).then(sent => {
+        setTimeout(() => {
+            bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+            bot.deleteMessage(chatId, messageId).catch(() => {});
+        }, 5000);
+    });
+});
+
+
 
 // bot.onText(/@MaoDaoBot edit:(-\d+)/, (msg, match) => {
 // // bot.onText(/@MaoDaoBot edit:(\d+):(\d+):(.*)/, (msg, match) => {
@@ -791,19 +1105,26 @@ const formatParticipantList = function (participants, usernames, comments) {
 
 const getUsernameFromId = async (chatId, userId) => {
     try {
-        if (userId.length >= 2 && userId[0] === '#' && userId[userId.length - 1] === '#') {
-            const player = userId.slice(1, -1)
-            return player;
-        } else {
-            const chatMember = await bot.getChatMember(chatId, userId);
-            return chatMember.user.username ? `@${chatMember.user.username}` : `${chatMember.user.first_name} ${chatMember.user.last_name || ''}`;
+        // Виртуальные участники вида #Name#
+        if (typeof userId === 'string' && userId.startsWith('#') && userId.endsWith('#')) {
+            return userId.slice(1, -1);
         }
 
+        const groupSettings = loadGS(chatId);
+        const nickname = groupSettings.nicknames?.[userId];
+
+        const chatMember = await bot.getChatMember(chatId, userId);
+        const baseName = chatMember.user.username
+            ? `@${chatMember.user.username}`
+            : `${chatMember.user.first_name} ${chatMember.user.last_name || ''}`;
+
+        return nickname ? `${nickname}` : baseName;
     } catch (error) {
         console.error(`Error fetching username for user ID ${userId}:`, error);
-        return null;
+        return 'Unknown';
     }
 };
+
 
 const printEvent = async (chatId, event, thread) => {
     // Fetch usernames for participants
@@ -845,6 +1166,12 @@ const printEvent = async (chatId, event, thread) => {
     });
 
     if (event.version >= '1.51') {
+        const reminderOptions = [0, 4, 6, 8, 12];
+        const reminderButtons = reminderOptions.map(h => ({
+            text: `${(event.remindJoin ?? 0)=== h ? '🟩' : '⬜️'}${h === 0 ? '0' : h + 'h'}`,
+            callback_data: `remindJoin_${chatId}_${event.id}|${h}`
+        }));
+        console.log(event.remindJoin, reminderButtons)
         bot.editMessageText(`/event ${event.title}|${event.description}|${event.time}`, {
             chat_id: event.chatBotId,
             message_id: event.originalMessageId, // Store and use the message ID of the event post
@@ -854,10 +1181,20 @@ const printEvent = async (chatId, event, thread) => {
                     [{text: `${event.eventLink}`, url: `${event.eventLink}`}],
                     [
                         { text: 'Edit', switch_inline_query_current_chat: `edit:${chatId}:${event.id}: ${event.title}|${event.description}|${event.time}` }
-                    ]
+                    ],
+                    [
+                        { text: 'Remind to join every X hours:', callback_data: 'noop' },
+                    ],
+                    reminderButtons
                 ]
             }
-        })
+        }).catch(error => {
+            if (error.response.body.error_code === 400 && error.response.body.description.includes('message is not modified')) {
+                console.log('Attempted to modify a message to author with identical content.');
+            } else {
+                throw error; // or handle other errors
+            }
+        });
     }
 
 }
