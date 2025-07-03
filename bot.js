@@ -224,11 +224,11 @@ bot.onText(/\/show_all/, (msg) => {
 
 
 
-bot.onText(/\/notify_all\s+((.|\n)+)/, (msg, match) => {
+bot.onText(/^\/(notify_all|all)\s+((.|\n)+)/, (msg, match) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
     const username = msg.from.username;
-    const message = match[1];
+    const message = match[2];
     const threadId = msg.message_thread_id;
     let thread = threadId ? { message_thread_id: threadId } : {}
     const group = loadGroup(chatId);
@@ -358,6 +358,38 @@ function loadEvents(chatId) {
         const eventId = file.split('_')[1].split('.')[0];
         return loadEvent(chatId, eventId);
     }).filter(event => event !== null);
+}
+
+async function newEvent(chatId, thread, msg, event = {}) {
+
+    if (Object.keys(event).length === 0) {
+        const eventId = new Date().getTime();
+        event = {
+            id: eventId,
+            chatId,
+            thread,
+            title: '',
+            description: '',
+            time: '',
+            eventLink: '',
+            originalMessageId: msg.message_id,
+            authorId: msg.from.id,
+            addPlayerMsgId: null,
+            removePlayerMsgId: null,
+            comments: {},
+            remindMsgs: {},
+            remindJoin: 0,
+            participants: {
+                go: [],
+                cantGo: [],
+                late: []
+            }
+        };
+    } else {
+        console.log(390, event,event === {})
+    }
+    await saveEvent(chatId, event.id, event);
+    return event;
 }
 
 function remindJoinEvent(chatId, eventId) {
@@ -535,6 +567,7 @@ bot.onText(/\/tz/, async (msg) => {
 
 });
 
+
 // bot.onText(/\/create_event (.+)/s, (msg, match) => {
 bot.onText(/\/(create_event|event) (.+)/s, async (msg, match) => {
     const chatId = msg.chat.id;
@@ -559,29 +592,18 @@ bot.onText(/\/(create_event|event) (.+)/s, async (msg, match) => {
         eventLink = `https://t.me/c/${formattedChatId}/${thread.message_thread_id}/${msg.message_id+1}`;
     }
 
-    const eventId = new Date().getTime();
-    const event = {
-        id: eventId,
-        chatId,
-        thread,
+    event = await newEvent(chatId, thread, msg)
+    const update = {
         title,
         description,
         time,
         eventLink,
         originalMessageId: msg.message_id,
-        authorId: msg.from.id,
-        addPlayerMsgId: null,
-        removePlayerMsgId: null,
-        comments: {},
-        remindMsgs: {},
-        remindJoin: 0,
-        participants: {
-            go: [],
-            cantGo: [],
-            late: []
-        }
+        authorId: msg.from.id
     };
-
+    event = { ...event, ...update };
+    console.log(605, event)
+    eventId = event.id
     saveEvent(chatId, eventId, event);
     const eventText = `📅 ${title}\n${description}\n🕗 ${time}\n\n🟢 Going:\n\n\n🔴 Can't Go:\n\n\n⏰ Late:\n`;
 
@@ -592,8 +614,8 @@ bot.onText(/\/(create_event|event) (.+)/s, async (msg, match) => {
                 [{ text: 'Go', callback_data: `go_${chatId}_${eventId}` },
                 { text: 'Can\'t go', callback_data: `cantgo_${chatId}_${eventId}` }],
                 [{ text: 'Attend but late', callback_data: `late_${chatId}_${eventId}` }],
-                [{ text: 'Add', callback_data: `add_${chatId}_${eventId}` },
-                { text: 'Remove', callback_data: `remove_${chatId}_${eventId}` }],
+                // [{ text: 'Add', callback_data: `add_${chatId}_${eventId}` },
+                // { text: 'Remove', callback_data: `remove_${chatId}_${eventId}` }],
                 [{ text: `${eventLink}`, url: `${eventLink}` }]
             ]
         }
@@ -618,6 +640,13 @@ bot.onText(/\/(create_event|event) (.+)/s, async (msg, match) => {
                     [{text: `${eventLink}`, url: `${eventLink}`}],
                     [
                         { text: 'Edit', switch_inline_query_current_chat: `edit:${chatId}:${eventId}: ${event.title}|${event.description}|${event.time}` }
+                    ],
+                    [
+                        { text: '➕ Add player', callback_data: `add_${chatId}_${event.id}` },
+                        { text: '➖ Remove player', callback_data: `remove_${chatId}_${event.id}` }
+                    ],
+                    [
+                        { text: '🖼️ Add image', callback_data: `addimage_${chatId}_${event.id}` }
                     ],
                     [
                         { text: 'Remind to join every X hours:', callback_data: 'noop' }
@@ -651,6 +680,9 @@ bot.onText(/\/(create_event|event) (.+)/s, async (msg, match) => {
 const cronJobs = new Map();
 bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
+    if (data === 'noop') {
+        return;
+    }
     const [mainPart, argPart] = data.split('|');
     const [action, chatId, eventId, threadId = null] = mainPart.split('_');
 //    const args = argPart.split('_');
@@ -694,7 +726,36 @@ bot.on('callback_query', async (callbackQuery) => {
         const groupSettings = loadGS(chatId);
         groupSettings.tz = args[0] ?? groupSettings?.tz ?? "-04";
         saveGS(chatId, groupSettings);
+    } else if (action === 'pickdate') {
+        event.eDate = args[0]
 
+        if (event.garbage?.calendar?.length) {
+            for (const messageId of event.garbage.calendar) {
+                bot.deleteMessage(chatId, messageId).catch(() => {});
+            }
+
+            // Optionally clear after deletion:
+            event.garbage.calendar = [];
+        }
+        saveEvent(chatId, eventId, event);
+        pickTime(chatId, eventId, event);
+    } else if (action === 'selecthour') {
+        event.eTime = args[0]
+
+        if (event.garbage?.calendar?.length) {
+            for (const messageId of event.garbage.calendar) {
+                bot.deleteMessage(chatId, messageId).catch(() => {});
+            }
+
+            // Optionally clear after deletion:
+            event.garbage.calendar = [];
+        }
+        saveEvent(chatId, eventId, event);
+        if (event.description === '') {
+
+        } else {
+            printEvent(chatId, event, thread);
+        }
     } else if (action === 'remindJoin') {
         // let freq = parseInt(args[1] ?? 0)
         let freq = parseInt(args[0] ?? 0)
@@ -731,7 +792,12 @@ bot.on('callback_query', async (callbackQuery) => {
         }
         saveEvent(chatId, eventId, event);
         printEvent(chatId, event, thread);
-
+    } else if (action === 'addimage') {
+        bot.sendMessage(event.authorId, `Please reply to this message with an image to add to the event:\nImage for event ID ${event.id}`, realThread)
+            .then(sent => {
+                event.awaitingImage = sent.message_id;
+                saveEvent(chatId, eventId, event);
+            });
     } else if (action === 'cantgo') {
         event.participants.cantGo.push(userId);
         saveEvent(chatId, eventId, event);
@@ -742,11 +808,11 @@ bot.on('callback_query', async (callbackQuery) => {
         printEvent(chatId, event, thread);
     } else if (action === 'add') {
         // bot.sendMessage(userId, 'Please enter the name or ID of the player to add:');
-        bot.sendMessage(chatId, 'Add player:', realThread)
+        bot.sendMessage(event.authorId, `Add player:${chatId}:${eventId}:`, realThread)
             .then((sentMessage) => {
                 event.addPlayerMsgId = sentMessage.message_id
                 saveEvent(chatId, eventId, event);
-                printEvent(event.chatId, event, thread);
+                //printEvent(event.chatId, event, thread);
             });
     } else if (action === 'link') {
         // bot.sendMessage(userId, 'Please enter the name or ID of the player to add:');
@@ -758,11 +824,11 @@ bot.on('callback_query', async (callbackQuery) => {
             });
     } else if (action === 'remove') {
         // bot.sendMessage(userId, 'Please enter the name or ID of the player to add:');
-        bot.sendMessage(chatId, 'Remove player:', realThread)
+        bot.sendMessage(event.authorId, `Remove player:${chatId}:${eventId}:`, realThread)
             .then((sentMessage) => {
                 event.removePlayerMsgId = sentMessage.message_id
                 saveEvent(chatId, eventId, event);
-                printEvent(chatId, event, thread);
+                // printEvent(chatId, event, thread);
             });
     }
 
@@ -771,14 +837,14 @@ bot.on('callback_query', async (callbackQuery) => {
 });
 
 //
-bot.onText(/@MaoDaoBot edit:(-\d+):(\d+):(.*)/s, (msg, match) => {
+bot.onText(/^@MaoDaoBot edit:(-\d+):(\d+):(.*)/s, (msg, match) => {
     console.log(match, msg.from.id)
 // bot.on('edited_message', async (msg) => {
     const chatId = match[1];
     const eventId = match[2];
     const newContent = match[3];
     const event =  loadEvent(chatId, eventId);
-    console.log('442',event)
+    // console.log('442',event)
 
     if (event.id !== eventId || msg.from.id !== event.authorId) {
     // const chatId = msg.chat.id;
@@ -812,7 +878,8 @@ bot.onText(/@MaoDaoBot edit:(-\d+):(\d+):(.*)/s, (msg, match) => {
     }
 });
 
-bot.onText(/\/callme (.+)/, (msg, match) => {
+// bot.onText(/^\/callme (.+)/, (msg, match) => {
+bot.onText(/^\/callme(?:@\w+)?\s(.+)/, (msg, match) => {
     const chatId = msg.chat.id;
     const userId = msg.from.id;
     const newNickname = match[1].trim();
@@ -849,9 +916,9 @@ bot.onText(/\/callme (.+)/, (msg, match) => {
     saveGS(chatId, groupSettings);
 
     bot.sendMessage(chatId, `Your nickname has been set to: ${newNickname}`, thread).then(sent => {
-        setTimeout(() => {
-            bot.deleteMessage(chatId, sent.message_id).catch(() => {});
-            bot.deleteMessage(chatId, messageId).catch(() => {});
+        setTimeout(async () => {
+            await bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+            await bot.deleteMessage(chatId, messageId).catch(() => {});
         }, 5000);
     });
 });
@@ -925,6 +992,17 @@ bot.on('new_chat_members', (msg) => {
     });
 });
 
+bot.on('left_chat_member', (msg) => {
+    const chatId = msg.chat.id;
+    const userId = msg.left_chat_member.id;
+
+    const group = loadGroup(chatId);
+    if (group.has(userId)) {
+        group.delete(userId);
+        saveGroup(chatId, group);
+    }
+});
+
 
 bot.on('edited_message', async (msg) => {
 
@@ -958,17 +1036,88 @@ bot.on('edited_message', async (msg) => {
     }
 });
 
+bot.onText(/\/help/, (msg) => {
+    const chatId = msg.chat.id;
+    const threadId = msg.message_thread_id;
+    const thread = threadId ? { message_thread_id: threadId } : {};
+
+    const helpText = `
+<b>Список команд бота:</b>
+
+<b>Основные команды:</b>
+/start - Необходимо выполнить эту команду в личном сообщении к боту. 
+     Это даст возможность получать личные сообщения от бота.
+     Эти сообщения используются для напоминаний о мероприятиях и ивентах.
+     А также для оповещения командой "/notify_all".
+/help - Показать это справочное сообщение
+
+<b>Команды группы "all":</b>
+/join или /join_all - Присоединиться к группе "all"
+/leave или /leave_all - Покинуть группу "all"
+/add_all @username1 @username2 - Добавить пользователей в группу "all" (только для админов)
+/show_all - Показать список участников группы "all" (только для админов)
+/notify_all сообщение - Отправить сообщение всем участникам группы "all"
+
+<b>Команды событий:</b>
+/event или /create_event Название и дата  | Описание | Время - Создать новое событие
+Пример: /event Воскресенье, 25 декабря 2023, Хоккей | Игра на льду | 20:00
+/tz - Установить часовой пояс группы (только для админов)
+
+<b>Персональные команды:</b>
+/callme Никнейм - Установить свой никнейм в группе
+Пример: /callme Хоккейный фанат
+
+<b>Как использовать события:</b>
+1. Создайте событие командой /event
+2. Участники могут нажимать кнопки:
+   - "Go" - Я иду
+   - "Can't go" - Не смогу прийти
+   - "Attend but late" - Приду, но позже
+3. Можно отвечать на сообщение события, чтобы добавить комментарий
+4. Организатор может добавлять/удалять участников через кнопки в личном чате с ботом
+
+Все команды работают как в групповых чатах, так и в личных сообщениях с ботом.
+`;
+
+    bot.sendMessage(chatId, helpText, {
+        ...thread,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true
+    }).then((sentMessage) => {
+        // Удалить сообщение через 2 минуты
+        setTimeout(() => {
+            bot.deleteMessage(chatId, sentMessage.message_id).catch(err =>
+                console.warn('Failed to delete help message:', err.message)
+            );
+        }, 120000);
+    });
+});
 
 bot.on('message', async (msg) => {
-    const chatId = msg.chat.id;
+    let chatId = msg.chat.id;
     // const messageId = msg.message_id;
     const userId = msg.from.id;
     const threadId = msg.message_thread_id;
     let thread = threadId ? { message_thread_id: threadId } : {}
 
     if (msg.reply_to_message) {
+        // const isFromBot = msg.reply_to_message.from?.id === bot.getMe().then(me => me.id);
+        //
+        // if (!isFromBot) {
+        //     return ;
+        // }
 
         const repliedMessageId = msg.reply_to_message.message_id;
+        // const originalText = msg.reply_to_message.text
+        const originalText = msg.reply_to_message?.text ?? '';
+        // const match = originalText.match(/^Add player:(-?\d+):(\d+):/);
+        const match = originalText.match(/^(Add|Remove) player:(-?\d+):(\d+):/);
+
+        if (match) {
+            chatId = match[2];
+            //const eventId = match[3];
+        }
+
         const events = loadEvents(chatId);
         const event = events.find(event => event.postMessageId === repliedMessageId);
         const eventAdd = events.find(event => event.addPlayerMsgId === repliedMessageId);
@@ -1022,7 +1171,7 @@ bot.on('message', async (msg) => {
             }
 
 
-            bot.deleteMessage(chatId, msg.message_id).catch((error) => {
+            bot.deleteMessage(msg.chat.id, msg.message_id).catch((error) => {
                 if (error.response.body.error_code === 400 && error.response.body.description.includes("message can't be deleted")) {
                     console.log(msg.text)
                     console.log("478 The message can't be deleted. It might be too old or already deleted.");
@@ -1033,7 +1182,7 @@ bot.on('message', async (msg) => {
                 }
             });
 
-            bot.deleteMessage(chatId, repliedMessageId).catch((error) => {
+            bot.deleteMessage(msg.chat.id, repliedMessageId).catch((error) => {
                 if (error.response.body.error_code === 400 && error.response.body.description.includes("message can't be deleted")) {
                     console.log(msg.text)
                     console.log("489 The message can't be deleted. It might be too old or already deleted.");
@@ -1060,7 +1209,7 @@ bot.on('message', async (msg) => {
             }
 
 
-            bot.deleteMessage(chatId, msg.message_id).catch((error) => {
+            bot.deleteMessage(msg.chat.id, msg.message_id).catch((error) => {
                 if (error.response.body.error_code === 400 && error.response.body.description.includes("message can't be deleted")) {
                     console.log(msg.text)
                     console.log("512 The message can't be deleted. It might be too old or already deleted.");
@@ -1071,7 +1220,7 @@ bot.on('message', async (msg) => {
                 }
             });
 
-            bot.deleteMessage(chatId, repliedMessageId).catch((error) => {
+            bot.deleteMessage(msg.chat.id, repliedMessageId).catch((error) => {
                 if (error.response.body.error_code === 400 && error.response.body.description.includes("message can't be deleted")) {
                     console.log(msg.text)
                     console.log("523 The message can't be deleted. It might be too old or already deleted.");
@@ -1142,18 +1291,22 @@ const printEvent = async (chatId, event, thread) => {
     const responseText = `📅 ${event.title}\n${event.description}\n🕗 ${event.time}\n\n🟢 Going:\n${goList}\n\n🔴 Can't Go:\n${cantGoList}\n\n⏰ Late:\n${lateList}`;
     //
     // // Edit the event post text
+    // if (event.imageFileId) {
+    //     await bot.sendPhoto(chatId, event.imageFileId, { ...thread });
+    // }
     bot.editMessageText(responseText, {
         chat_id: chatId,
         message_id: event.postMessageId, // Store and use the message ID of the event post
         ...thread,
         parse_mode: 'HTML',
+        "disable_web_page_preview": true,
         reply_markup: {
             inline_keyboard: [
                 [{text: 'Go', callback_data: `go_${chatId}_${event.id}`},
                 {text: 'Can\'t go', callback_data: `cantgo_${chatId}_${event.id}`}],
                 [{text: 'Attend but late', callback_data: `late_${chatId}_${event.id}`}],
-                [{ text: 'Add', callback_data: `add_${chatId}_${event.id}` },
-                { text: 'Remove', callback_data: `remove_${chatId}_${event.id}` }],
+                // [{ text: 'Add', callback_data: `add_${chatId}_${event.id}` },
+                // { text: 'Remove', callback_data: `remove_${chatId}_${event.id}` }],
                 [{ text: `${event.eventLink}`, url: `${event.eventLink}` }]
             ]
         }
@@ -1164,6 +1317,30 @@ const printEvent = async (chatId, event, thread) => {
             throw error; // or handle other errors
         }
     });
+    console.log('Setting reaction with thread:', thread);
+
+    // bot.setMessageReaction(
+    //     chatId,
+    //     event.postMessageId,
+    //     [
+    //         { type: 'emoji', emoji: '👍' },
+    //         { type: 'emoji', emoji: '👎' },
+    //         { type: 'emoji', emoji: '❓' }
+    //     ],
+    //     {
+    //         ...thread
+    //     }
+    // ).catch(error => {
+    // await bot.setMessageReaction(chatId, event.postMessageId, [
+    //     { type: 'emoji', emoji: '👍' },
+    //     { ...thread}
+    // ]).catch(error => {
+    //     if (error.response.body.error_code === 400 && error.response.body.description.includes('REACTION_EMPTY')) {
+    //         console.log('Attempted to set reaction with REACTION_EMPTY');
+    //     } else {
+    //         throw error; // or handle other errors
+    //     }
+    // });
 
     if (event.version >= '1.51') {
         const reminderOptions = [0, 4, 6, 8, 12];
@@ -1171,7 +1348,7 @@ const printEvent = async (chatId, event, thread) => {
             text: `${(event.remindJoin ?? 0)=== h ? '🟩' : '⬜️'}${h === 0 ? '0' : h + 'h'}`,
             callback_data: `remindJoin_${chatId}_${event.id}|${h}`
         }));
-        console.log(event.remindJoin, reminderButtons)
+
         bot.editMessageText(`/event ${event.title}|${event.description}|${event.time}`, {
             chat_id: event.chatBotId,
             message_id: event.originalMessageId, // Store and use the message ID of the event post
@@ -1181,6 +1358,13 @@ const printEvent = async (chatId, event, thread) => {
                     [{text: `${event.eventLink}`, url: `${event.eventLink}`}],
                     [
                         { text: 'Edit', switch_inline_query_current_chat: `edit:${chatId}:${event.id}: ${event.title}|${event.description}|${event.time}` }
+                    ],
+                    [
+                        { text: '➕ Add player', callback_data: `add_${chatId}_${event.id}` },
+                        { text: '➖ Remove player', callback_data: `remove_${chatId}_${event.id}` }
+                    ],
+                    [
+                        { text: '🖼️ Add image', callback_data: `addimage_${chatId}_${event.id}` }
                     ],
                     [
                         { text: 'Remind to join every X hours:', callback_data: 'noop' },
@@ -1198,3 +1382,250 @@ const printEvent = async (chatId, event, thread) => {
     }
 
 }
+
+function generateDateKeyboard(chatId, eventId) {
+    const today = new Date();
+    const dates = [];
+    const oneDayMs = 24 * 60 * 60 * 1000;
+
+    for (let i = 0; i < 25; i++) {
+        const d = new Date(today.getTime() + i * oneDayMs);
+        dates.push({
+            // label: d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' }),
+            label: d.getDate().toString(),
+            data: d.toISOString().split('T')[0], // YYYY-MM-DD
+            dayOfWeek: d.getDay() === 0 ? 7 : d.getDay() // Mon=1...Sun=7
+        });
+    }
+    const dayLabels = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+    const headerRow = dayLabels.map(label => ({
+        text: label,
+        callback_data: 'noop'
+    }));
+
+    // Формируем недельные строки
+    const rows = [headerRow]; // <-- добавляем заголовок
+
+    let weekRow = new Array(7).fill(null);
+    dates.forEach(date => {
+        weekRow[date.dayOfWeek - 1] = {
+            text: date.label,
+            callback_data: `pickdate_${chatId}_${eventId}|${date.data}`
+        };
+
+        // Если это воскресенье или последний элемент — пушим строку
+        if (date.dayOfWeek === 7 || date === dates[dates.length - 1]) {
+            // заполняем пустые ячейки
+            for (let i = 0; i < 7; i++) {
+                if (!weekRow[i]) {
+                    weekRow[i] = { text: ' ', callback_data: 'noop' };
+                }
+            }
+            rows.push(weekRow);
+            weekRow = new Array(7).fill(null);
+        }
+    });
+
+    return {
+        text: '📅 Выберите дату:',
+        reply_markup: {
+            inline_keyboard: rows
+        }
+    };
+}
+
+function generateTimeKeyboard(chatId, userId, eventId, state = {}) {
+    const rows = [];
+    const hourRow = [];
+    for (let h = 8; h < 23; h++) {
+        const hStr = h.toString().padStart(2, '0');
+        const display = `${h}:${'00'}`;
+        hourRow.push({
+            text: state.hour === hStr ? `🕐${display}` : display,
+            callback_data: `selecthour_${chatId}_${eventId}|${hStr}`
+        });
+        if ((h-2) % 5 === 0) rows.push(hourRow.splice(0, hourRow.length));
+    }
+    if (hourRow.length > 0) {
+        rows.push(hourRow);
+    }
+    // const minuteRow = ['00', '15', '30', '45'].map(m => ({
+    //     text: state.minute === m ? `⏱${m}` : m,
+    //     callback_data: `selectminute_${chatId}_${eventId}|${m}`
+    // }));
+
+    // const saveButton = [{
+    //     text: (state.hour && state.minute) ? '✅ Сохранить' : '🔒 Сначала выберите время',
+    //     callback_data: (state.hour && state.minute)
+    //         ? `save_${chatId}_${eventId}|T${state.hour}:${state.minute}`
+    //         : 'noop'
+    // }];
+
+    return {
+        text: `⏰ Выберите время:`,
+        reply_markup: {
+            inline_keyboard: [
+                ...rows,
+                // minuteRow,
+                // saveButton
+            ]
+        }
+    };
+}
+
+
+bot.onText(/\/new/, async (msg) => {
+    const chatId = msg.chat.id;
+    const threadId = msg.message_thread_id;
+    let thread = threadId ? { message_thread_id: threadId } : {};
+    const event = await newEvent(chatId, thread, msg)
+    if (msg.chat.type === 'private') {
+        return bot.sendMessage(msg.chat.id, '⚠️ This command can only be used in a group.')
+            .then(sent => {
+                setTimeout(() => {
+                    bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+                    bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+                }, 3000);
+            });
+    } else {
+        console.log(1370, event, event.id)
+        const calendar = generateDateKeyboard(chatId,event.id);
+        bot.sendMessage(chatId, calendar.text, { ...thread, ...calendar })
+            .then(sent => {
+                event.garbage = {};
+                event.garbage.calendar = [sent.message_id, msg.message_id];
+                saveEvent(chatId, event.id, event);
+                setTimeout(() => {
+                    bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+                    bot.deleteMessage(chatId, msg.message_id).catch(() => {});
+                }, 10000);
+            });
+        ;
+    }
+
+});
+
+async function pickTime(chatId, eventId, event) {
+    const timeKeyboard = generateTimeKeyboard(chatId, event.authorId, eventId)
+    console.log(timeKeyboard)
+    bot.sendMessage(chatId, timeKeyboard.text, { ...event.thread, ...timeKeyboard })
+        .then(sent => {
+            event.garbage = {};
+            event.garbage.calendar = [sent.message_id];
+            saveEvent(chatId, eventId, event);
+
+        });
+}
+
+bot.onText(/^\/reaction/, async (msg) => {
+    const chatId = msg.chat.id;
+    const threadId = msg.message_thread_id;
+
+    if (!threadId) {
+        bot.sendMessage(chatId, 'This command only works in a topic (thread).');
+        return;
+    }
+
+
+    const botUser = await bot.getMe();
+    const info = await bot.getChatMember(chatId, botUser.id);
+    console.log('Bot status:', info.status);
+    console.log('Bot permissions:', info);
+
+    try {
+        // Send message to the same thread
+        const sentMsg = await bot.sendMessage(chatId, 'React to this message!', {
+            message_thread_id: threadId
+        });
+        console.log(`Message ${sentMsg.message_id} in thread ${threadId} chatId ${chatId} sent`);
+        // Add emoji reactions
+        const reaction = [
+            // { type: 'emoji', emoji: '🔥' },
+            { type: 'emoji', emoji: '💯' },
+            // { type: 'emoji', emoji: '👍' }
+        ];
+        const reaction1 = [
+            // { type: 'emoji', emoji: '🔥' }
+            { type: 'emoji', emoji: '😢' }
+            // { type: 'emoji', emoji: '👍' }
+        ];
+        await bot.setMessageReaction(chatId, sentMsg.message_id, {reaction: JSON.stringify(reaction)}, { message_thread_id: threadId });
+        // await bot.setMessageReaction(chatId, sentMsg.message_id, {reaction: JSON.stringify(reaction1)}, { message_thread_id: threadId });
+
+        console.log(`Reactions set for message ${sentMsg.message_id} in thread ${threadId}`);
+    } catch (err) {
+        console.error('Error setting reaction:', err.response?.body || err);
+        bot.sendMessage(chatId, 'Failed to send message or set reactions.', {
+            message_thread_id: threadId
+        });
+    }
+});
+
+// const testEmojis = ["👍", '👎', '❤️', '🔥', '🥲', '🎉', '💯', '🤔', '😢', '❓', '👀',
+// "✅" ,"❎" ,"☑️" ,"⬜️" ,"🟥" ,"✅"];
+const testEmojis = [
+    // Основные реакции
+    '👍', '👎', '❤️', '🔥', '🥰', '😆', '🤔', '😮', '😢', '🎉',
+
+    // Специальные отметки
+    '✅', '✔️', '☑️', '❎', '✖️', '❌', '⭕', '🚫',
+
+    // Альтернативные варианты
+    '🔴', '🟢', '🔵', '🟣', '⚪', '⚫',
+
+    // Дополнительные
+    '❗', '❕', '⁉️', '‼️', '💯', '🔺', '🔻'
+];
+bot.onText(/^\/test_reactions/, async (msg) => {
+    const chatId = msg.chat.id;
+    const threadId = msg.message_thread_id;
+
+    if (!threadId) {
+        bot.sendMessage(chatId, 'Please use this command inside a topic (thread).');
+        return;
+    }
+
+    try {
+        const sentMsg = await bot.sendMessage(chatId, 'Testing available reactions...', {
+            message_thread_id: threadId
+        });
+
+        console.log(`Testing reactions on message ${sentMsg.message_id}`);
+
+        const allowed = [];
+        const denied = [];
+
+        for (const emoji of testEmojis) {
+            const reaction = [
+                { type: 'emoji', emoji }
+            ]
+            try {
+                await bot.setMessageReaction(chatId, sentMsg.message_id, {reaction: JSON.stringify(reaction)}, { message_thread_id: threadId });
+
+                console.log(`✅ Reaction allowed: ${emoji}`);
+                allowed.push(emoji);
+            } catch (err) {
+                const desc = err.response?.body?.description || '';
+                if (desc.includes('REACTION_EMPTY')) {
+                    console.log(`❌ Reaction blocked: ${emoji}`);
+                    denied.push(emoji);
+                } else {
+                    console.error(`⚠️ Unexpected error for ${emoji}:`, desc);
+                    denied.push(`${emoji} (error)`);
+                }
+            }
+        }
+
+        // Report results
+        await bot.sendMessage(chatId,
+            `✅ Allowed: ${allowed.join(' ')}\n❌ Blocked: ${denied.join(' ')}`,
+            { message_thread_id: threadId }
+        );
+
+    } catch (err) {
+        console.error('Failed to test reactions:', err);
+        bot.sendMessage(chatId, 'Failed to perform reaction test.', {
+            message_thread_id: threadId
+        });
+    }
+});
