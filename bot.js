@@ -7,11 +7,73 @@ const path = require('path');
 const TOKEN = fs.readFileSync('tg-token', 'utf8').trim();
 
 // Create a bot that uses 'polling' to fetch new updates
-const bot = new TelegramBot(TOKEN, { polling: true });
+const bot = new TelegramBot(TOKEN, {
+    polling: {
+        params: {
+            allowed_updates: JSON.stringify([
+                'message',
+                'chat_member',
+                'my_chat_member',
+                'edited_message',
+                'chat_join_request',
+                'callback_query'
+            ]) ,
+        }
+    }
+});
+
 
 // Directory to store the group member files
 const GROUP_DIR = 'groups';
 
+function captchaMiddleware(handler) {
+    return async (msg, match) => {
+        const chatId = msg.chat.id;
+        const userId = msg.from.id;
+        const gs = loadGS(chatId);
+        if(gs.protect !== 'on') return handler(msg, match);
+        // Check if user is in pending CAPTCHA list
+        if (gs.banned && (gs.banned[userId] !== undefined)
+            && (gs.banned[userId].ttl > Date.now())) {
+            // User hasn't passed CAPTCHA - delete their message
+            try {
+                await bot.deleteMessage(chatId, msg.message_id);
+                console.log(`Deleted message from pending user ${userId}`);
+            } catch (error) {
+                console.error('Error deleting message:', error);
+            }
+            return; // Stop further processing
+        }
+
+        // User passed CAPTCHA or not in list - proceed to original handler
+        return handler(msg, match);
+    };
+}
+
+function adminMiddleware(handler) {
+    return async (msg, match) => {
+        const chatId = msg.chat.id;
+        const userId = msg.from.id;
+        const threadId = msg.message_thread_id;
+        let thread = threadId ? { message_thread_id: threadId } : {}
+        // Check if sender is admin (for demonstration purposes, adminId is hard-coded)
+        const admin = await bot.getChatAdministrators(chatId);
+        const isAdmin = admin.some(member => member.user.id === userId);
+
+        if (!isAdmin) {
+            bot.sendMessage(chatId, "❌ This command is for admins only.", thread)
+                .then((sentMessage) => {
+                    setTimeout(() => {
+                        bot.deleteMessage(chatId, sentMessage.message_id)
+                    }, 3000)
+
+                });
+            return;
+        }
+
+        return handler(msg, match);
+    };
+}
 
 async function checkDeleteMessagePermission(chatId) {
     try {
@@ -63,6 +125,65 @@ function saveGroup(chatId, group) {
     fs.writeFileSync(groupFile, JSON.stringify([...group]), 'utf8');
 }
 
+function generateRandomNumber(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+async function restrictUser(bot, chatId, userId) {
+    try {
+        await bot.restrictChatMember(chatId, userId, {
+            can_send_messages: false,
+            can_send_media_messages: false,
+            can_send_other_messages: false,
+            can_add_web_page_previews: false,
+            until_date: Math.floor(Date.now() / 1000) + 180 // Ограничение на 1 час
+        });
+    } catch (error) {
+        console.error('Error restricting user:', error);
+    }
+}
+
+// Функция для снятия ограничений
+async function unrestrictUser(bot, chatId, userId) {
+    try {
+        await bot.restrictChatMember(chatId, userId, {
+            can_send_messages: true,
+            can_send_media_messages: true,
+            can_send_other_messages: true,
+            can_add_web_page_previews: true,
+            until_date: 0
+        });
+    } catch (error) {
+        console.error('Error unrestricting user:', error);
+    }
+}
+
+async function createCaptchaKeyboard(correctAnswer, chatId) {
+    const buttons = [];
+    const answers = new Set([correctAnswer]);
+
+    // Генерируем 4 уникальных неправильных ответа
+    while (answers.size < 5) {
+        answers.add(generateRandomNumber(0, 100));
+    }
+
+    // Преобразуем в массив и перемешиваем
+    const answersArray = Array.from(answers).sort(() => Math.random() - 0.5);
+    console.log(answersArray);
+
+    // Создаем кнопки
+    await answersArray.forEach(answer => {
+        buttons.push({
+            text: answer.toString(),
+            callback_data: `captcha_${chatId}|${answer}`
+        });
+    });
+
+    return {
+        inline_keyboard: [buttons],
+        resize_keyboard: true
+    };
+}
 bot.on('polling_error', (error) => {
     console.error(`Polling error: ${error.message}`);
     // Optionally, implement a retry mechanism or delay to prevent constant retries.
@@ -645,9 +766,9 @@ bot.onText(/\/(create_event|event) (.+)/s, async (msg, match) => {
                         { text: '➕ Add player', callback_data: `add_${chatId}_${event.id}` },
                         { text: '➖ Remove player', callback_data: `remove_${chatId}_${event.id}` }
                     ],
-                    [
-                        { text: '🖼️ Add image', callback_data: `addimage_${chatId}_${event.id}` }
-                    ],
+                    // [
+                    //     { text: '🖼️ Add image', callback_data: `addimage_${chatId}_${event.id}` }
+                    // ],
                     [
                         { text: 'Remind to join every X hours:', callback_data: 'noop' }
                     ],
@@ -706,8 +827,9 @@ bot.on('callback_query', async (callbackQuery) => {
 
     const event = loadEvent(chatId, eventId);
 
-    if (!event && action !== 'tz') {
+    if (!event && action !== 'tz' && action !== 'captcha' && action !== 'restoreuser') {
         bot.sendMessage(chatId, 'Event not found.');
+        console.log('Event not found.', data, event, args);
         return;
     }
 
@@ -822,6 +944,77 @@ bot.on('callback_query', async (callbackQuery) => {
                 saveEvent(chatId, eventId, event);
                 printEvent(event.chatId, event, thread);
             });
+    } else if (action === 'captcha') {
+        // bot.sendMessage(userId, 'Please enter the name or ID of the player to add:');
+        const gs = loadGS(chatId);
+        if (gs.banned[userId] !== undefined) {
+            let captchaParams = gs.banned[userId];
+            await bot.deleteMessage(chatId, captchaParams.captchaMessage).catch(() => {});
+            console.log('captchaParams', captchaParams, args)
+            if(captchaParams.answer == parseInt(args[0])) {
+                if (chatId.toString().startsWith('-100')) {
+                    unrestrictUser(bot, chatId, userId);
+                }
+                gs.kicked[userId] = gs.banned[userId];
+                delete gs.banned[userId];
+                saveGS(chatId, gs);
+                bot.sendMessage(chatId, 'Welcome!', realThread)
+                    .then((sentMessage) => {
+                        setTimeout(() => {
+                            bot.deleteMessage(chatId, sentMessage.message_id).catch(err =>
+                                console.warn('Failed to delete help message:', err.message)
+                            );
+                        }, 2000);
+                    });
+            } else {
+                bot.sendMessage(chatId, 'Wrong answer! You\'s been banned!', realThread)
+                    .then((sentMessage) => {
+                        setTimeout(() => {
+                            bot.deleteMessage(chatId, sentMessage.message_id).catch(err =>
+                                console.warn('Failed to delete help message:', err.message)
+                            );
+                        }, 2000);
+                    });
+                // const chat = await bot.getChat(chatId);
+                // return chat.type;
+                if (chatId.toString().startsWith('-100')) {
+                    unrestrictUser(bot, chatId, userId);
+                    // await bot.kickChatMember(chatId, userId);
+                    await bot.banChatMember(chatId, userId);
+                } else {
+                    await bot.banChatMember(chatId, userId);
+                }
+            }
+        }
+    } else if (action === 'restoreuser') {
+        const admin = await bot.getChatAdministrators(chatId);
+        const isAdmin = admin.some(member => member.user.id === userId);
+
+        if (!isAdmin) {
+            bot.sendMessage(chatId, "❌ This command is for admins only.", thread)
+                .then((sentMessage) => {
+                    setTimeout(() => {
+                        bot.deleteMessage(chatId, sentMessage.message_id)
+                    }, 3000)
+
+                });
+            return;
+        } else {
+            const gs = loadGS(chatId);
+
+            const targetUserId = args[0];
+            delete gs.kicked[targetUserId];
+            await bot.unbanChatMember(chatId, targetUserId);
+
+            bot.sendMessage(chatId, `Unbanned!`, thread).then(sent => {
+                setTimeout(async () => {
+
+                    await bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+                    await bot.deleteMessage(chatId, messageId).catch(() => {});
+                }, 5000);
+            });
+        }
+
     } else if (action === 'remove') {
         // bot.sendMessage(userId, 'Please enter the name or ID of the player to add:');
         bot.sendMessage(event.authorId, `Remove player:${chatId}:${eventId}:`, realThread)
@@ -923,6 +1116,183 @@ bot.onText(/^\/callme(?:@\w+)?\s(.+)/, (msg, match) => {
     });
 });
 
+bot.onText(/^\/protect$/, (msg, match) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const threadId = msg.message_thread_id;
+    const messageId = msg.message_id;
+    let thread = threadId ? { message_thread_id: threadId } : {};
+
+    const groupSettings = loadGS(chatId);
+
+    groupSettings.protect = 'on';
+    if(!groupSettings.banned) {
+        groupSettings.banned = {};
+    }
+    if(!groupSettings.kicked) {
+        groupSettings.kicked = {};
+    }
+
+    saveGS(chatId, groupSettings);
+
+    bot.sendMessage(chatId, `New user should pass captcha now!`, thread).then(sent => {
+        setTimeout(async () => {
+            await bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+            await bot.deleteMessage(chatId, messageId).catch(() => {});
+        }, 5000);
+    });
+});
+bot.onText(/^\/unprotect$/, adminMiddleware((msg, match) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const threadId = msg.message_thread_id;
+    const messageId = msg.message_id;
+    let thread = threadId ? { message_thread_id: threadId } : {};
+
+    const groupSettings = loadGS(chatId);
+
+    groupSettings.protect = 'off';
+    saveGS(chatId, groupSettings);
+
+    bot.sendMessage(chatId, `Protection is off!`, thread).then(sent => {
+        setTimeout(async () => {
+            await bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+            await bot.deleteMessage(chatId, messageId).catch(() => {});
+        }, 5000);
+    });
+}));
+
+bot.onText(/^\/ban (\d+)$/, adminMiddleware(async (msg, match) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const targetUserId = match[1];
+    const threadId = msg.message_thread_id;
+    const messageId = msg.message_id;
+    let thread = threadId ? { message_thread_id: threadId } : {};
+
+    const gs = loadGS(chatId);
+
+    try {
+        const chatMember = await bot.getChatMember(chatId, targetUserId);
+        const user = chatMember.user;
+        if (gs.banned[targetUserId] !== undefined) {
+            gs.kicked[targetUserId] = gs.banned[targetUserId]
+            delete gs.banned[targetUserId];
+        } else {
+            gs.kicked[targetUserId]= {
+                'date': new Date().getTime(),
+                'reason': 'Admin request',
+                'user': targetUserId,
+                'name': user.first_name,
+                'username': user.username,
+                'ttl': new Date().getTime()+1,
+                'answer': 'admin'
+            };
+        }
+        saveGS(chatId, gs)
+        await bot.banChatMember(chatId, targetUserId);
+        bot.sendMessage(chatId, `${user.first_name} has been Banned!`, thread).then(sent => {
+            setTimeout(async () => {
+                await bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+                await bot.deleteMessage(chatId, messageId).catch(() => {});
+            }, 5000);
+        });
+    } catch (error) {
+        bot.sendMessage(chatId, `${error} User not found in chat member list!`, thread).then(sent => {
+            setTimeout(async () => {
+                await bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+                await bot.deleteMessage(chatId, messageId).catch(() => {});
+            }, 5000);
+        });
+    }
+}));
+
+bot.onText(/^\/unban (\d+)$/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const targetUserId = match[1];
+    const threadId = msg.message_thread_id;
+    const messageId = msg.message_id;
+    let thread = threadId ? { message_thread_id: threadId } : {};
+
+    const gs = loadGS(chatId);
+
+// Unban the user completely
+    delete gs.kicked[targetUserId];
+    await bot.unbanChatMember(chatId, targetUserId);
+
+    bot.sendMessage(chatId, `Unbanned!`, thread).then(sent => {
+        setTimeout(async () => {
+            await bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+            await bot.deleteMessage(chatId, messageId).catch(() => {});
+        }, 5000);
+    });
+});
+
+
+
+bot.onText(/^\/kicked$/, adminMiddleware(async (msg, match) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const threadId = msg.message_thread_id;
+    const messageId = msg.message_id;
+    let thread = threadId ? { message_thread_id: threadId } : {};
+
+    const gs = loadGS(chatId);
+
+    if (!gs.kicked || Object.keys(gs.kicked).length === 0) {
+        bot.sendMessage(chatId, "📭 No recently kicked users found.", thread).then(sent => {
+            setTimeout(async () => {
+                await bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+                await bot.deleteMessage(chatId, messageId).catch(() => {});
+            }, 5000);
+        });
+        return;
+    }
+
+    const recentKicks = Object.entries(gs.kicked)
+        .sort(([,a], [,b]) => b.date - a.date)
+        .slice(0, 10); // Last 10 users
+
+    let message = "🔴 **Recently Kicked Users**\n\n";
+    const keyboard = [];
+
+    recentKicks.forEach(([userId, kickData], index) => {
+        const timeAgo = Math.floor((Date.now() - kickData.date) / 1000 / 60); // minutes ago
+        const userInfo = `@${kickData.username || kickData.name}`;
+
+        message += `${index + 1}. ${userInfo} (${timeAgo}m ago)\\-\n`;
+        // message += `   Reason: ${kickData.reason}\\-\n\n`;
+
+        // Add restore button for each user
+        keyboard.push([
+            {
+                text: `✅ Restore ${kickData.name}`,
+                callback_data: `restoreuser_${chatId}|${userId}`
+            }
+        ]);
+    });
+    // keyboard.push([
+    //     { text: "🔄 Refresh", callback_data: "refresh_kicks" },
+    //     { text: "🗑️ Clear All", callback_data: "clear_all_kicks" }
+    // ]);
+
+    const options = {
+        parse_mode: 'HTML',
+        reply_markup: {
+            inline_keyboard: keyboard
+        },
+        ...thread
+    };
+
+
+    bot.sendMessage(chatId, message, options).then(sent => {
+        setTimeout(async () => {
+            await bot.deleteMessage(chatId, sent.message_id).catch(() => {});
+            await bot.deleteMessage(chatId, messageId).catch(() => {});
+        }, 20000);
+    });
+}));
 
 
 // bot.onText(/@MaoDaoBot edit:(-\d+)/, (msg, match) => {
@@ -959,36 +1329,148 @@ bot.onText(/^\/callme(?:@\w+)?\s(.+)/, (msg, match) => {
 //         bot.sendMessage(chatId, 'You are already a member of the "all" group.', thread);
 //     }
 // });
+// Enable this via bot.start({ allowed_updates: ['chat_member'] })
+bot.on('chat_member', async (ctx) => {
+    // console.log('chat_member',ctx) // very cool event!
+    // const update = ctx.chatMember;
+    const chatId = ctx.chat.id;
+    const threadId = ctx?.message_thread_id;
+    let thread = threadId ? { message_thread_id: threadId } : {};
+    const userId = ctx.new_chat_member.user.id
+    const gs = loadGS(chatId);
+    if(gs.protect === 'on' && ctx.chat.type === 'supergroup') {
+        if (ctx.new_chat_member.status === 'member' &&
+            ctx.old_chat_member.status === 'left') {
 
-bot.on('new_chat_members', (msg) => {
+            // User joined
+            console.log('User joined via chat_member:', ctx.new_chat_member.user.id);
+            await handleNewUserJoin(ctx.chat, userId, gs, thread, ctx.new_chat_member.user);
+        }
+    }
+
+});
+
+async function handleNewUserJoin(chat, userId, groupSettings, thread, newMember) {
+    const chatId = chat.id;
+    console.log('protect on handleNewUserJoin', chatId, userId, groupSettings, thread, newMember);
+    if (!groupSettings.banned) {
+        groupSettings.banned = {};
+        groupSettings.kicked = {};
+    }
+
+    const correctAnswer = generateRandomNumber(0, 100);
+    groupSettings.banned[userId] = {
+        'date': new Date().getTime(),
+        'reason': 'New member',
+        'user': userId,
+        'name': newMember.first_name,
+        'username': newMember.username,
+        'ttl': new Date().getTime()+180,
+        'answer': correctAnswer
+    };
+    saveGS(chatId, groupSettings);
+    const isSupergroup = chat.type === 'supergroup';
+    const isGroup = chat.type === 'group';
+    if(isSupergroup) {
+       await restrictUser(bot, chatId, userId);
+    }
+
+    const keyboard = await createCaptchaKeyboard(correctAnswer, chatId );
+
+    const captchaMessage = await bot.sendMessage(
+        chatId,
+        `👋 Добро пожаловать, ${newMember.first_name}!\n\n` +
+        `Если вы не бот, выберете цифру которую вы видите на экране \n>>> ${correctAnswer} <<<\n\n` +
+        `У вас есть 2 минуты чтобы ответить.`,
+        {
+            parse_mode: 'Markdown',
+            reply_markup: keyboard,
+            ...thread
+        }
+    );
+    groupSettings.banned[userId].captchaMessage = captchaMessage.message_id;
+    saveGS(chatId, groupSettings);
+
+    const timeout = setTimeout(async ()  => {
+        const gs = loadGS(chatId);
+
+        bot.deleteMessage(chatId, captchaMessage.message_id); // Удаляем captchaMessage
+        // Время вышло - кикаем пользователя
+        if (gs.banned[userId] !== undefined) {
+            try {
+                // await bot.kickChatMember(chatId, userId);
+                if (isSupergroup) {
+                    // await bot.unrestrictChatMember(chatId, userId);
+                    unrestrictUser(bot, chatId, userId);
+                    // await bot.kickChatMember(chatId, userId);
+                    await bot.banChatMember(chatId, userId);
+                } else {
+                    await bot.banChatMember(chatId, userId);
+                }
+
+                await bot.sendMessage(
+                    chatId,
+                    `⏰ Время вышло! ${newMember.first_name} не прошел проверку.`,
+                    thread
+                );
+
+                gs.kicked[userId] = gs.banned[userId];
+                delete gs.banned[userId];
+                saveGS(chatId, gs);
+            } catch (error) {
+                if (!error.response?.body?.description?.includes('USER_NOT_PARTICIPANT')) {
+                    console.error('Error kicking user:', error);
+                }
+                // console.error('Error kicking user:', error);
+            }
+        }
+    }, 2 * 60 * 1000); // 2 минуты
+}
+
+bot.on('new_chat_members',async (msg) => {
     const chatId = msg.chat.id;
     const threadId = msg.message_thread_id;
     let thread = threadId ? { message_thread_id: threadId } : {};
+    console.log('new_chat_members handler!')
 
-    msg.new_chat_members.forEach((newMember) => {
+    msg.new_chat_members.forEach(async (newMember) => {
         const userId = newMember.id; // Get the correct user ID
+        if(userId == '7202342115') return;
 
-        bot.sendMessage(
-            chatId,
-            `Welcome, ${newMember.first_name}! Please click [here](https://t.me/MaoDaoBot?start=from_group) to start interacting with me in private chat.`,
-            { parse_mode: 'Markdown', ...thread }
-        );
+        // if (newMember.is_bot) continue; //not sure if this is needed
+        const groupSettings = loadGS(chatId);
+        console.log('groupSettings.protect :', groupSettings.protect ?? 'off');
+        if(groupSettings.protect === 'on') {
+            console.log('protect on new_chat_members');
+            await handleNewUserJoin(msg.chat, userId, groupSettings, thread, newMember);
 
-        const group = loadGroup(chatId);
-        if (!group.has(userId)) {
-            group.add(userId);
-            saveGroup(chatId, group);
 
-            bot.getChat(chatId).then(chat => {
-                const chatName = chat.title || chat.username || chat.first_name || chat.last_name;
-                bot.sendMessage(chatId, `${newMember.first_name}, you have joined the "all" group in chat: ${chatName}`, thread);
-            }).catch(err => {
-                bot.sendMessage(userId, `You have joined the "all" group in chat: ${chatId}`);
-                console.error(err);
-            });
         } else {
-            bot.sendMessage(chatId, `${newMember.first_name}, you are already a member of the "all" group.`, thread);
+            bot.sendMessage(
+                chatId,
+                `Welcome, ${newMember.first_name}! Please click [here](https://t.me/MaoDaoBot?start=from_group) to start interacting with me in private chat.`,
+                { parse_mode: 'Markdown', ...thread }
+            );
+
+            const group = loadGroup(chatId);
+            if (!group.has(userId)) {
+                group.add(userId);
+                saveGroup(chatId, group);
+
+                bot.getChat(chatId).then(chat => {
+                    const chatName = chat.title || chat.username || chat.first_name || chat.last_name;
+                    bot.sendMessage(chatId, `${newMember.first_name}, you have joined the "all" group in chat: ${chatName}`, thread);
+                }).catch(err => {
+                    bot.sendMessage(userId, `You have joined the "all" group in chat: ${chatId}`);
+                    console.error(err);
+                });
+            } else {
+                bot.sendMessage(chatId, `${newMember.first_name}, you are already a member of the "all" group.`, thread);
+            }
         }
+
+
+
     });
 });
 
@@ -1319,28 +1801,6 @@ const printEvent = async (chatId, event, thread) => {
     });
     console.log('Setting reaction with thread:', thread);
 
-    // bot.setMessageReaction(
-    //     chatId,
-    //     event.postMessageId,
-    //     [
-    //         { type: 'emoji', emoji: '👍' },
-    //         { type: 'emoji', emoji: '👎' },
-    //         { type: 'emoji', emoji: '❓' }
-    //     ],
-    //     {
-    //         ...thread
-    //     }
-    // ).catch(error => {
-    // await bot.setMessageReaction(chatId, event.postMessageId, [
-    //     { type: 'emoji', emoji: '👍' },
-    //     { ...thread}
-    // ]).catch(error => {
-    //     if (error.response.body.error_code === 400 && error.response.body.description.includes('REACTION_EMPTY')) {
-    //         console.log('Attempted to set reaction with REACTION_EMPTY');
-    //     } else {
-    //         throw error; // or handle other errors
-    //     }
-    // });
 
     if (event.version >= '1.51') {
         const reminderOptions = [0, 4, 6, 8, 12];
@@ -1363,9 +1823,9 @@ const printEvent = async (chatId, event, thread) => {
                         { text: '➕ Add player', callback_data: `add_${chatId}_${event.id}` },
                         { text: '➖ Remove player', callback_data: `remove_${chatId}_${event.id}` }
                     ],
-                    [
-                        { text: '🖼️ Add image', callback_data: `addimage_${chatId}_${event.id}` }
-                    ],
+                    // [
+                    //     { text: '🖼️ Add image', callback_data: `addimage_${chatId}_${event.id}` }
+                    // ],
                     [
                         { text: 'Remind to join every X hours:', callback_data: 'noop' },
                     ],
@@ -1449,17 +1909,6 @@ function generateTimeKeyboard(chatId, userId, eventId, state = {}) {
     if (hourRow.length > 0) {
         rows.push(hourRow);
     }
-    // const minuteRow = ['00', '15', '30', '45'].map(m => ({
-    //     text: state.minute === m ? `⏱${m}` : m,
-    //     callback_data: `selectminute_${chatId}_${eventId}|${m}`
-    // }));
-
-    // const saveButton = [{
-    //     text: (state.hour && state.minute) ? '✅ Сохранить' : '🔒 Сначала выберите время',
-    //     callback_data: (state.hour && state.minute)
-    //         ? `save_${chatId}_${eventId}|T${state.hour}:${state.minute}`
-    //         : 'noop'
-    // }];
 
     return {
         text: `⏰ Выберите время:`,
@@ -1474,7 +1923,7 @@ function generateTimeKeyboard(chatId, userId, eventId, state = {}) {
 }
 
 
-bot.onText(/\/new/, async (msg) => {
+bot.onText(/^\/new$/, async (msg) => {
     const chatId = msg.chat.id;
     const threadId = msg.message_thread_id;
     let thread = threadId ? { message_thread_id: threadId } : {};
@@ -1629,3 +2078,7 @@ bot.onText(/^\/test_reactions/, async (msg) => {
         });
     }
 });
+
+bot.onText(/(.*)/s, captchaMiddleware((msg, match) => {
+    console.log('Processing non-command message:', msg.chat.username, msg.chat.id, msg.chat.type, msg.text);
+}));
