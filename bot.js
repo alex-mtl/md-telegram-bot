@@ -1357,7 +1357,10 @@ async function handleNewUserJoin(chat, userId, groupSettings, thread, newMember)
         groupSettings.banned = {};
         groupSettings.kicked = {};
     }
-
+    alreadyBanned = groupSettings.banned[userId] ?? false;
+    if(alreadyBanned && alreadyBanned.ttl > new Date().getTime()) {
+        return;
+    }
     const correctAnswer = generateRandomNumber(0, 100);
     groupSettings.banned[userId] = {
         'date': new Date().getTime(),
@@ -1410,7 +1413,8 @@ async function handleNewUserJoin(chat, userId, groupSettings, thread, newMember)
 
                 await bot.sendMessage(
                     chatId,
-                    `⏰ Время вышло! ${newMember.first_name} не прошел проверку.`,
+                    // `⏰ Время вышло! ${newMember.first_name} не прошел проверку.`,
+                    `⏰ Время вышло! @${newMember.username || newMember.name} не прошел проверку.`,
                     thread
                 );
 
